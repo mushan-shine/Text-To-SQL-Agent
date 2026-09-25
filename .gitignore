@@ -4,3 +4,5 @@ __pycache__/
 runs/
 data/beaver/
 *.parquet
+data/beaver_db/
+reports/

@@ -45,7 +45,7 @@ environment:
 
 qualification:
   stability_repeats: 3        # executions per gold SQL on each engine (result cache disabled)
-  try_adapter: true           # try sqlglot mysql→databricks transpilation on failing cases
+  try_adapter: true           # apply documented MySQL→Databricks rules (benchmark/beaver/adapter.py) to failing cases
   # Adapted SQL that reproduces the MySQL gold result is recorded, but is only
   # admitted to PRIMARY evaluation when this is true.
-  admit_validated_adaptations: false
+  admit_validated_adaptations: true   # decision B (2026-09-25): documented + result-validated rule adaptations are PRIMARY

@@ -117,6 +117,95 @@ def canonical_match(a: list[Row] | None, b: list[Row] | None) -> CanonicalCompar
     return CanonicalComparison(s, m, o, reason)
 
 
+# --------------------------------------------------------------------------- cross-engine
+
+FLOAT_REL_TOL = 1e-6
+CROSS_ENGINE_RULE = ("cross_engine_v2: DECIMAL values compared at their own displayed scale "
+                     f"(MySQL AVG/division keep 4 decimals); float vs float rel tol {FLOAT_REL_TOL:g}; "
+                     "strings exact after strip; NULL only equals NULL")
+
+
+def _is_num(v: Any) -> bool:
+    return isinstance(v, (int, float, Decimal)) and not isinstance(v, bool)
+
+
+def _scale(d: Decimal) -> int:
+    exp_ = d.as_tuple().exponent
+    return -exp_ if isinstance(exp_, int) and exp_ < 0 else 0
+
+
+def cross_engine_value_equal(a: Any, b: Any) -> bool:
+    """Same value, allowing for how each engine *represents* numbers.
+
+    A DECIMAL carries the precision its engine computed it at (MySQL returns
+    ``AVG(int)`` as ``6.8333``). The other engine's value is equal if it rounds
+    to that DECIMAL at that scale — i.e. |a-b| <= half a unit in the last place.
+    """
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, bool) or isinstance(b, bool):
+        a, b = (int(a) if isinstance(a, bool) else a), (int(b) if isinstance(b, bool) else b)
+    if _is_num(a) and _is_num(b):
+        if isinstance(a, float) and math.isnan(a) or isinstance(b, float) and math.isnan(b):
+            return isinstance(a, float) and isinstance(b, float) and math.isnan(a) and math.isnan(b)
+        scales = [_scale(x) for x in (a, b) if isinstance(x, Decimal)]
+        if scales:
+            half_ulp = Decimal(5).scaleb(-min(scales) - 1)
+            da = a if isinstance(a, Decimal) else Decimal(repr(a)) if isinstance(a, float) else Decimal(a)
+            db = b if isinstance(b, Decimal) else Decimal(repr(b)) if isinstance(b, float) else Decimal(b)
+            return abs(da - db) <= half_ulp * (1 + Decimal("1e-9"))
+        return math.isclose(float(a), float(b), rel_tol=FLOAT_REL_TOL, abs_tol=1e-9)
+    return canonical_value(a) == canonical_value(b)
+
+
+def _row_equal(r: Row, s: Row) -> bool:
+    return len(r) == len(s) and all(cross_engine_value_equal(x, y) for x, y in zip(r, s))
+
+
+def _bucket_key(r: Row) -> tuple:
+    # non-numeric values must match exactly, so they are a safe bucketing key
+    return tuple(None if _is_num(v) else canonical_value(v) for v in r)
+
+
+def _multiset_equal(a: list[Row], b: list[Row]) -> bool:
+    if len(a) != len(b):
+        return False
+    pool: dict[tuple, list[Row]] = {}
+    for r in b:
+        pool.setdefault(_bucket_key(r), []).append(r)
+    for r in a:
+        cands = pool.get(_bucket_key(r), [])
+        hit = next((i for i, c in enumerate(cands) if _row_equal(r, c)), None)
+        if hit is None:
+            return False
+        cands.pop(hit)
+    return True
+
+
+def _dedupe(rows: list[Row]) -> list[Row]:
+    out: list[Row] = []
+    for r in rows:
+        if not any(_row_equal(r, s) for s in out if _bucket_key(s) == _bucket_key(r)):
+            out.append(r)
+    return out
+
+
+def cross_engine_match(candidate: list[Row] | None, reference: list[Row] | None) -> CanonicalComparison:
+    """Compare results of the same SQL on two engines (Phase 0 qualification only)."""
+    a, b = [tuple(r) for r in (candidate or [])], [tuple(r) for r in (reference or [])]
+    if not a and not b:
+        return CanonicalComparison(True, True, True, "Both empty")
+    if not a or not b:
+        return CanonicalComparison(False, False, False, "One is empty, other is not")
+    if len(a[0]) != len(b[0]):
+        return CanonicalComparison(False, False, False, f"Column count mismatch: {len(a[0])} vs {len(b[0])}")
+    m = _multiset_equal(a, b)
+    s = m or _multiset_equal(_dedupe(a), _dedupe(b))
+    o = len(a) == len(b) and all(_row_equal(x, y) for x, y in zip(a, b))
+    reason = "match" if m else ("set match, duplicate counts differ" if s else "values differ")
+    return CanonicalComparison(s, m, o, reason)
+
+
 def result_hash(rows: list[Row] | None) -> str:
     """Order- and duplicate-insensitive fingerprint (official EX semantics)."""
     canon = sorted(set(canonical_rows(rows)), key=lambda r: json.dumps(r))

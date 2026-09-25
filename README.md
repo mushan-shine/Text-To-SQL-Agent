@@ -33,7 +33,7 @@ Main decisions:
 | Canonical comparison for MySQL vs Databricks, official BEAVER comparison for EX | Drivers print the same value differently (`AVG` → `12.5000` vs `12.5`). Later, gold and generated SQL both run on Databricks, so the official `str()`-set comparison applies (`benchmark/beaver/evaluator.py`). |
 | `_ci` MySQL columns → `STRING COLLATE UTF8_LCASE` | This restores MySQL's case-insensitive string semantics in the schema, so the SQL text stays untouched. Accent-insensitivity and PAD SPACE are not mirrored; result comparison would catch any drift they cause. |
 | `ANSI_MODE=false`, `DATETIME → TIMESTAMP_NTZ` | These match MySQL behaviour: `x/0 → NULL`, and no session time-zone shift. One global environment serves both gold and generated SQL. |
-| Adapter = separate record, validated by result equivalence, kept out of PRIMARY by default | Equivalence on one data instance does not prove the queries are semantically equal. |
+| Adapter = documented rules only (MySQL `VARIANCE/STD/STDDEV` → `VAR_POP/STDDEV_POP`; drop frame clauses that MySQL ignores on `RANK/ROW_NUMBER/LAG/…`), stored as separate records and admitted to PRIMARY only when the adapted SQL reproduces the MySQL result (decision B, 2026-09-25) | The MySQL manual fixes the meaning of each rule, and the per-case result check guards the implementation. Generic transpilation (sqlglot) was dropped: it repaired 0 of 63 cases because it copies `VARIANCE` verbatim. |
 | Whole database replicated, not just gold tables | Replicating only the gold tables would leak ground truth into retrieval. |
 | `benchmark.cases_agent_view` + `AgentTask` | Agents can only reach `case_id / question / db` (setting=0). |
 | Package `dbx/` instead of `databricks/` | A top-level `databricks` package would shadow `databricks.sql` and `databricks.sdk`. |
@@ -77,7 +77,9 @@ Tests: `python -m pytest` (offline, uses fake executors).
 
 ## Known limitations (Phase 0)
 
-- Result equivalence is checked on the BEAVER data instance only. It is not a proof of semantic equivalence.
+- Result equivalence is checked on the BEAVER data instance only. Adaptations are therefore restricted to rules whose meaning the MySQL manual defines.
+- Cross-engine comparison compares a DECIMAL at its own displayed scale (MySQL `AVG`/division keep 4 decimals) and floats with relative tolerance 1e-6 (`cross_engine_v2` in `benchmark/beaver/evaluator.py`).
+- Gold SQL whose result depends on how ties are ordered (window functions or `LIMIT` over non-unique keys) differs between engines and is excluded, not repaired.
 - `UTF8_LCASE` does not reproduce accent-insensitive or PAD SPACE collations.
 - MySQL zero-dates (`0000-00-00`) become NULL. They are counted per table and tolerated only on temporal columns.
 - The Databricks gold result is hashed with numeric values canonicalised to 6 decimals.

@@ -94,9 +94,28 @@ def write_rows(runner: Any, layout: Layout, schema_name: str, table: str, rows: 
         runner.run(f"CREATE TABLE {fq} AS {src}")
     else:
         runner.run(f"CREATE TABLE IF NOT EXISTS {fq} AS {src} LIMIT 0")
+        ensure_columns(runner, fq, arrow_schema)
         runner.run(f"INSERT INTO {fq} BY NAME {src}")
     log.info("wrote %d rows to %s (%s)", len(rows), fq, mode)
     return fq
+
+
+_SQL_TYPES = {"string": "STRING", "int64": "BIGINT", "bool": "BOOLEAN", "timestamp[us, tz=UTC]": "TIMESTAMP"}
+
+
+def ensure_columns(runner: Any, fq: str, arrow_schema: pa.Schema) -> list[str]:
+    """Additive schema evolution for append-only evidence tables: add columns
+    that exist in ``arrow_schema`` but not yet in the Delta table."""
+    existing = {str(r[0]).lower() for r in runner.run(f"DESCRIBE TABLE {fq}")
+                if r and r[0] and not str(r[0]).startswith("#")}
+    added = []
+    for f in arrow_schema:
+        if f.name.lower() not in existing:
+            runner.run(f"ALTER TABLE {fq} ADD COLUMNS (`{f.name}` {_SQL_TYPES[str(f.type)]})")
+            added.append(f.name)
+    if added:
+        log.info("added columns %s to %s", added, fq)
+    return added
 
 
 def table_exists(runner: Any, layout: Layout, schema_name: str, table: str) -> bool:

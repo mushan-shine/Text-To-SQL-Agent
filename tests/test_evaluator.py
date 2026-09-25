@@ -67,3 +67,33 @@ class TestCanonical:
         rows = [(Decimal("1.50"), dt.date(2020, 1, 1), None)]
         again = [tuple(r) for r in json.loads(serialize_rows(rows))]
         assert result_hash(again) == result_hash(rows)
+
+
+class TestCrossEngine:
+    """MySQL (reference) vs Databricks (candidate) value representations."""
+
+    def test_mysql_decimal_scale(self):
+        from benchmark.beaver.evaluator import cross_engine_value_equal as eq
+        assert eq(Decimal("6.8333"), 6.833333333333333)      # AVG(int): MySQL keeps 4 decimals
+        assert eq(Decimal("10.9091"), 10.909090909090908)
+        assert eq(Decimal("0E-8"), 0.0)
+        assert eq(Decimal("57"), 57)
+        assert not eq(Decimal("6.8333"), 6.8340)               # differs at the displayed scale
+        assert not eq(Decimal("24.8056"), 26.264705882352946)  # population vs sample variance
+
+    def test_float_tolerance_and_nulls(self):
+        from benchmark.beaver.evaluator import cross_engine_value_equal as eq
+        assert eq(0.4330127020004725, 0.4330127018922194)      # summation-order noise
+        assert not eq(4474.394116906014, 4483.289532645389)
+        assert eq(None, None) and not eq(0.0, None)
+        assert eq("Chemistry", "Chemistry ") and not eq("Chemistry", "chemistry")
+
+    def test_row_matching(self):
+        from benchmark.beaver.evaluator import cross_engine_match
+        mysql = [("Physics", Decimal("6.8333"), 3), ("Math", Decimal("1.5000"), 2)]
+        dbx = [("Math", 1.5, 2), ("Physics", 6.833333333333333, 3)]
+        c = cross_engine_match(dbx, mysql)
+        assert c.set_match and c.multiset_match and not c.ordered_match
+        assert not cross_engine_match([("Math", 1.6, 2)], [("Math", Decimal("1.5000"), 2)]).set_match
+        assert cross_engine_match([(1,), (1,)], [(1,)]).set_match
+        assert not cross_engine_match([(1,), (1,)], [(1,)]).multiset_match
