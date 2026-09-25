@@ -84,7 +84,7 @@
 | 1.3 | **Few-shot 生成器**：prompt 模板、few-shot 示例、SQL 提取 | `agent/generator.py` | few-shot 示例**不能与评测样本重叠**（要做检查）；glm 把拒答包进代码块时能识别；prompt 写明目标方言是 Databricks SQL，并说明 BEAVER 中"方差/标准差"指**总体**统计量（用 `VAR_POP/STDDEV_POP`）。这是评测环境约定，不含任何 Gold 信息 |
 | 1.4 | **执行器**：只读校验，在 Databricks 上执行 | `agent/executor.py`（复用 `execution/`） | 写操作会被拒绝 |
 | 1.5 | **评测器**：与冻结的 `gold_results` 比较（官方比较规则） | `evaluation/baseline.py` | 只评 PRIMARY case |
-| 1.6 | **小样本试点**：约 20 个 case | 试点报告 | 看首次准确率和失败类型分布，决定正式样本规模；是否换模型需要单独决策 |
+| 1.6 | **小样本试点**：约 20 个 case → 已改为**开发集**（30 道非评测题，决策 D2） | 试点报告 | 看首次准确率和失败类型分布，决定正式样本规模；是否换模型需要单独决策。**prompt / 模型 / 参数只在开发集上迭代** |
 | 1.7 | **正式 Baseline**：全部 PRIMARY case，每题只生成一次，不重试 | Baseline 结果 | First-pass Accuracy 来自实际运行 |
 
 ### Phase 2 · Trace / 可观测性

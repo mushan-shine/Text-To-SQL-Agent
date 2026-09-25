@@ -189,6 +189,8 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 | # | 日期 | 决策 | 理由 |
 |---|---|---|---|
 | D1 | 2026-09-25 | **Phase 0 采用方案 B（规则化适配）**：① 跨引擎比较按 DECIMAL 自身的小数位比较，浮点数相对误差 1e-6；② 改写规则只有两条，都有 MySQL 官方文档依据：`VARIANCE/STD/STDDEV` → `VAR_POP/STDDEV_POP`，删除排名类窗口函数上被 MySQL 忽略的窗口帧；③ 改写后的 SQL 必须跑出与 MySQL 一致的结果才算通过，通过的进入主评测（PRIMARY）；④ 结果依赖并列值排序的 Gold 直接排除并计数。sqlglot 自动改写弃用 | 严格方案只有约 46 个可用 case，达不到关卡一要求的 50；方案 B 每条改写都有文档依据，并且逐条做了结果验证 |
+| D2 | 2026-09-25 | **① prompt 升级为 `baseline-v2`**：规则 4 改为明确的 MySQL→Databricks 统计函数对照（题干写 STDDEV/VARIANCE 或 "never STDDEV_POP" 时，一律写 `STDDEV_POP`/`VAR_POP`）。**② 建立开发集**：从评测集以外的 dw 题中固定抽 30 题（排除 few-shot 示例，种子 20260926），Gold 结果在 MySQL 上实时计算，只保留改写后在 Databricks 上能复现的题；从此 prompt、模型和参数的迭代只在开发集上做，89 道评测题只在配置冻结后跑一次 | ① 26/89 道评测题（dw 全集 2,116/5,787）题干带 MySQL 函数名，v1 规则和这些题干冲突，照题干写必然判错。这是基于全局事实的环境说明，不含 Gold 信息。② 1.6 试点是在评测题上做的，继续在上面改 prompt 就等于在考题上调参 |
+| D3 | 2026-09-25 | **方案 A：保持 `glm-4-flash`，冻结 baseline 配置**（prompt `baseline-v2`、k=20、3 个 few-shot 示例），在 89 道评测题上跑一次正式 baseline，然后进入 Phase 2–6 搭 Inner Loop；**整个流程跑通后再换模型**，用同一套流程重跑对比 | 先让端到端流程跑起来。失败的结构清楚（20/21 个列报错是列挂错了表），Loop 有足够的可修素材。已知限制：首次准确率接近 0 时，Harm Rate 基本无法测量，换模型后补测 |
 
 ## 问题记录
 
@@ -207,6 +209,27 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 
 ---
 
-## 后续 Phase
+## Phase 1 · Few-shot Baseline
 
-Phase 0 通过后，在这里追加 Phase 1 的执行记录（步骤见 [ROADMAP.md](ROADMAP.md) 第三节）。
+分支 `phase1-baseline`。步骤见 [ROADMAP.md](ROADMAP.md) 第三节。配置：[config/phase1.yaml](../config/phase1.yaml)。
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| 1.1 | LLM 客户端 `agent/llm.py` | ✅ | 智谱 OpenAI 兼容接口，`do_sample=False`；408/429/5xx 退避重试；key 控制字符检查；调用次数和 token 预算上限；按 (模型, 参数, system, prompt) 指纹的本地缓存 |
+| 1.2 | 表检索 `agent/retriever.py` | ✅ | BM25（表名 ×3、列名 ×2、示例值 ×1）。schema 用 Databricks 实际列类型（beaver-table 里是 Oracle 类型 `VARCHAR2`）加示例取值。**k 在 300 道非评测题上调参**（`random.Random(20260925)`）：k=10 召回 0.73，k=15 0.84，**k=20 0.91（67% 的题能拿全 Gold 表）**，k=25 0.94，k=30 0.95，取拐点 k=20 |
+| 1.3 | 生成器 `agent/generator.py` | ✅ | prompt 版本 `baseline-v1`：规则 + schema + 3 个 few-shot 示例 + 问题。示例取自评测集之外的 dw 题（≤3 张表、≤900 字符，套用 Phase 0 改写规则后能按 Databricks 语法解析） |
+| 1.4 | 执行器 | ✅ | 复用 `execution/databricks_sql.py`，新增结果行数上限（50 万行，超出记为 `TOO_MANY_ROWS`） |
+| 1.5 | 评测 `evaluation/baseline.py` | ✅ | 生成结果先统一格式，再和冻结的 Gold 按 BEAVER 官方规则比较（`evaluate_against_gold`）；表召回率只作为评估诊断，不交给 Agent。测试共 71 个，全部通过 |
+| 1.5b | 冒烟测试（2 题） | ✅ | 链路跑通。2 题都执行报错，是模型错误：编造了不存在的表 `FAC_BUILDING` 和列 `COURSE_LEVEL`，并且没按规则用了 `STDDEV`。每次调用约 1.4 万 token、26 秒 |
+| 1.6 | 小样本试点（20 题） | ⏸ 待决策 | run `baseline-20260925T082731-3b1b4d`（prompt `baseline-v1`，glm-4-flash，k=20）：**0/20 答对**；能执行 9/20（11 题 `UNRESOLVED_COLUMN`，模型编造列名）；能执行的 9 题中 7 题数值不对、1 题列数不对、1 题返回空。平均表召回 0.85，Gold 表全部选到的 11 题也是 0 题答对，**瓶颈在生成**。每题约 1.38 万 token，中位耗时 14.7 秒。**发现方言冲突：** 89 道主评测题中 26 题（dw 全集 5,787 题中 2,116 题）题干写着 "using STDDEV only and never STDDEV_POP"。这是 MySQL 语义（MySQL `STDDEV` = 总体），在 Databricks 照原文写就是样本标准差，必然判错；prompt 规则 4 又要求用 `STDDEV_POP`，两者冲突。已人工核对评测代码无误 |
+| 1.6b | 开发集 + prompt v2 | ✅ 决策 D3 | **开发集**：看了 34 道候选题入选 30 题（淘汰 4 题：3 题在 Databricks 上无法复现，1 题报错）；领域复杂查询 17、复杂查询 7、领域查询 6。**baseline-v2**（run `baseline-20260925T084206-51d855`，glm-4-flash）：**0/30 答对**；能执行 4/30；报错 26 题（`UNRESOLVED_COLUMN` 21、`TABLE_OR_VIEW_NOT_FOUND` 2、语法错误 2、其他 1）；表召回 0.92，Gold 表全部选到的 22 题也是 0 题答对；仍有 3 题用了样本统计函数。**21 个列报错中有 20 个，这一列其实存在于另一张已选出的表里**，是把列挂错了表别名，并非凭空编造，Inner Loop 的 `SchemaSearch` 可以用查表方式修复。待决策：是否先用更强的智谱模型在开发集上探测一次 |
+| 1.7 | 正式 Baseline（89 题） | ✅ | run `baseline-20260925T085517-69b4ac`（配置 `baseline-v2` / glm-4-flash / k=20，只跑一次）：**首次准确率 2/89 = 2.25%**（dw_461、dw_104，都是领域复杂查询）；可执行 21/89 = 23.6%；执行报错 68 题（`UNRESOLVED_COLUMN` 58、表不存在 3、语法错误 3、其他 4）；能执行的 21 题中 14 题数值不对、4 题返回空、1 题列数不对、2 题答对。表召回 0.887（按标注计算，偏保守）；Gold 表全部选到的 58 题中答对 1 题，有缺表的 31 题中答对 1 题。共 89 次 LLM 调用、122 万 token（平均 1.37 万/题），中位耗时 16.5 秒。已发布到 Delta 和 MLflow（MLflow run `e062ead6e8634f2e845b46239fb48a21`）；v1 试点那次也已补发 |
+
+## Phase 2 · Trace / 可观测性
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| 2.1 | Delta 表 | ✅ | `traces.execution_traces`：每次尝试一行，已预留 Verifier / 诊断 / 修复字段，供 Phase 4–6 填写。`evaluation.evaluation_results`：判分结果（correct、表召回等）。`evaluation.runs`：运行汇总。**边界：用 Gold 算出来的字段只放 evaluation.\*，trace 里没有**，因为自检模式下的 Observer / Diagnoser 会读 trace（有测试保证） |
+| 2.2 | MLflow | ✅ | 实验 `/Users/mushan.ysl@gmail.com/self_healing_text2sql`（id 1654657461219271）。每次运行记录参数（模型、prompt 版本、k、few-shot 示例 id）、指标（准确率、可执行率、表召回、token、延迟）和产出文件（summary / run_meta / results） |
+| 2.3 | 发布脚本 | ✅ | `scripts/publish_run.py <run_dir>`：同一个 run_id 重复发布时，先删旧行再写，MLflow 按 run_id 标签复用，保证幂等。已发布开发集运行 `baseline-20260925T084206-51d855`（30 条 trace）。生成记录新增 `result_preview`（结果前 5 行），这是 Agent 自己能观察到的执行结果，不含 Gold |
+| 2.4 | 测试 | ✅ | 全部测试共 77 个，通过 |

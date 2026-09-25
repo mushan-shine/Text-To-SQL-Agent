@@ -53,6 +53,18 @@ def official_match(pred: list[Row] | None, gold: list[Row] | None) -> tuple[bool
     return False, "Values mismatch"
 
 
+def evaluate_against_gold(generated_rows: list[Row] | None, gold_result_json: str) -> tuple[bool, str]:
+    """Execution accuracy of generated SQL against a frozen gold result.
+
+    Frozen gold results are stored as canonical rows (``serialize_rows``), so the
+    generated rows are canonicalised the same way before BEAVER's official
+    comparison — otherwise e.g. ``Decimal('1.50')`` vs ``'1.5'`` would differ
+    only by formatting. Both sides come from the same engine (Databricks).
+    """
+    gold = [tuple(r) for r in json.loads(gold_result_json)]
+    return official_match(canonical_rows(generated_rows), gold)
+
+
 # --------------------------------------------------------------------------- canonical
 
 
