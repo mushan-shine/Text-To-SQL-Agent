@@ -91,6 +91,12 @@ class DatabricksSqlExecutor:
             except Exception:  # statements without a result set
                 return []
 
+    def query_df(self, sql: str):
+        """Run trusted project SQL and return a pandas DataFrame (dashboards / analysis)."""
+        with self._conn.cursor() as cur:
+            cur.execute(sql)
+            return cur.fetchall_arrow().to_pandas()
+
     def use(self, catalog: str, schema: str | None = None) -> None:
         self.run(f"USE CATALOG `{catalog}`")
         if schema:

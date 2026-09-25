@@ -285,3 +285,12 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 | Generic Retry + Oracle（上界） | 4 → 6 | 2.0 | 40.17 万 | 30 / 0 / 0 | 0 |
 
 **解读**：token 成本相近时，Targeted Loop 让更多 SQL 变得可执行（9 vs 6），这是工程层面的差异；但 glm-4-flash 生成的 SQL 即使能执行，结果也不对，所以恢复都是 0，与干预实验的结论一致。SelfVerifier 在开发集上漏报 3 题（能执行但答错），Oracle 会把这 3 题也送去修复，但同样修不好。
+
+## Phase 9 · Loop Debug Console（先于 Phase 7 / 8 实现）
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| 9.1 | 数据层 `app/data.py` | ✅ | 直接读取 Delta 表（evaluation.runs、traces.execution_traces、evaluation.evaluation_results、failure_labels、diagnoses、diagnosis_eval、benchmark.*），不读本地文件，新运行发布后自动出现。本地通过 profile 认证；在 Databricks Apps 中使用 App 自己的凭据加上 `DATABRICKS_WAREHOUSE_ID` |
+| 9.2 | 面板 `app/dashboard.py`（Streamlit） | ✅ 本地可用 | 5 个页签：**总览**（阶段状态、关键指标、全部运行）；**对照实验**（Phase 6 开发集 4 组的表格和图表 + **Phase 7 评测集预留区**）；**消融实验**（**Phase 8 预留表**，已列出 7 个计划消融组，结果发布后自动从"未运行"变为"已运行"）；**逐题追踪**（按运行和题目查看每次尝试的 SQL、执行结果、Verifier、诊断、修复技能、前后 SQL 对比，Gold 判分单独标注"Loop 不可见"）；**失败与诊断**（标注器主因与运行时诊断的分布、诊断准确率、按来源的准确率、混淆表）。启动：`streamlit run app/dashboard.py`，或用预览配置 `loop-console`（端口 8502） |
+| 9.3 | 验证 | ✅ | 本地预览 5 个页签都能渲染，没有报错。修复了两个问题：数据库空值读成 NaN 后被当作"真"（逐题追踪页报错），以及图表颜色映射和高度 |
+| 9.4 | 部署为 Databricks App | ⬜ | 待定：Free Edition 每个账号只能有 1 个 App，需要确认是否占用 gmv-rca-agent 的名额 |
