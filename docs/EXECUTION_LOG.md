@@ -201,7 +201,8 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 | 3 | 2026-09-25 | 3.2 | 不记得安装过 MySQL，不知道 root 密码 | 本机在 2021-06-05 用官方安装程序装过 MySQL 8.0.25（服务 `MySQL80`，端口 3306，已有库 `itstack`、`wechat`、`qgydb`） | 先试 Workbench 里保存的连接；不行就用官方的 `--init-file` 方法重置 root 密码（不影响已有数据），完成后删除含明文密码的 init 文件。**学员指南需要补充"安装 MySQL"这一步** |
 | 4 | 2026-09-25 | 3 | 试调用智谱时 `UnicodeEncodeError: 'gbk' codec can't encode character '\U0001f44b'` | Windows 终端默认 GBK 编码，打印不了模型回复里的 emoji（调用本身是成功的） | `scripts/phase0.py` 启动时把 stdout/stderr 改为 UTF-8；其他脚本可设置环境变量 `PYTHONIOENCODING=utf-8` |
 | 5 | 2026-09-25 | 4.1 | 脚本列出了 `__MACOSX\beaver_db\._dw.sql` 等 6 个"dump" | 压缩包在 macOS 上生成，带资源分叉垃圾文件 | `fetch_beaver_db.py` 解压时跳过 `__MACOSX/`、`._*`、`.DS_Store`；已删除之前解压出的垃圾文件 |
-| 6 | | | | | |
+| 6 | 2026-09-25 | 5.4 | 按方案 B 重跑时停在 88/100，日志约 20 分钟没有更新；MySQL 和 Databricks 上都没有正在执行的查询 | 第 89 个 case（dw_4004）返回 15,881 行，结果不一致时比较代码逐行两两比较（O(n²)，约 2.5 亿次），CPU 一直在算 | 大分组改成先排序、再逐行对齐（O(n log n)），16k 行约 0.5–1.5 秒；停掉原进程后从头重跑 |
+| 7 | | | | | |
 
 ---
 

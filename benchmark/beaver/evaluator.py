@@ -167,26 +167,52 @@ def _bucket_key(r: Row) -> tuple:
     return tuple(None if _is_num(v) else canonical_value(v) for v in r)
 
 
+GREEDY_LIMIT = 200  # bucket size up to which rows are paired by exhaustive search
+
+
+def _sort_key(r: Row) -> tuple:
+    return tuple((0, "") if v is None else (1, float(v), "") if _is_num(v) else (2, 0.0, canonical_value(v))
+                 for v in r)
+
+
+def _buckets(rows: list[Row]) -> dict[tuple, list[Row]]:
+    out: dict[tuple, list[Row]] = {}
+    for r in rows:
+        out.setdefault(_bucket_key(r), []).append(r)
+    return out
+
+
+def _bucket_equal(x: list[Row], y: list[Row]) -> bool:
+    if len(x) != len(y):
+        return False
+    if len(x) <= GREEDY_LIMIT:
+        pool = list(y)
+        for r in x:
+            hit = next((i for i, c in enumerate(pool) if _row_equal(r, c)), None)
+            if hit is None:
+                return False
+            pool.pop(hit)
+        return True
+    # Large bucket: rows that differ only by numeric noise sort into the same
+    # position, so pairwise comparison after sorting is O(n log n).
+    return all(_row_equal(r, s) for r, s in zip(sorted(x, key=_sort_key), sorted(y, key=_sort_key)))
+
+
 def _multiset_equal(a: list[Row], b: list[Row]) -> bool:
     if len(a) != len(b):
         return False
-    pool: dict[tuple, list[Row]] = {}
-    for r in b:
-        pool.setdefault(_bucket_key(r), []).append(r)
-    for r in a:
-        cands = pool.get(_bucket_key(r), [])
-        hit = next((i for i, c in enumerate(cands) if _row_equal(r, c)), None)
-        if hit is None:
-            return False
-        cands.pop(hit)
-    return True
+    ba, bb = _buckets(a), _buckets(b)
+    return ba.keys() == bb.keys() and all(_bucket_equal(ba[k], bb[k]) for k in ba)
 
 
 def _dedupe(rows: list[Row]) -> list[Row]:
     out: list[Row] = []
-    for r in rows:
-        if not any(_row_equal(r, s) for s in out if _bucket_key(s) == _bucket_key(r)):
-            out.append(r)
+    for bucket in _buckets(rows).values():
+        kept: list[Row] = []
+        for r in sorted(bucket, key=_sort_key):
+            if not (kept and _row_equal(r, kept[-1])):
+                kept.append(r)
+        out.extend(kept)
     return out
 
 
