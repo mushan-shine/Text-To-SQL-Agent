@@ -52,7 +52,13 @@ def build_report(runs_dir: str | Path = "runs/phase0") -> tuple[str, dict[str, A
 
     lines += ["## Q2 BEAVER Schema 是否能够在 Databricks 中正确还原？", ""]
     if rep:
-        answers["Q2"] = rep["tables"] > 0 and rep["tables"] == rep["tables_fidelity_ok"] and not rep["missing_dbs_in_mysql"]
+        rows_equal = rep["rows_mysql"] == rep["rows_databricks"]
+        if rep["tables"] == 0 or rep["missing_dbs_in_mysql"] or not rows_equal:
+            answers["Q2"] = "no"
+        elif rep["tables"] == rep["tables_fidelity_ok"]:
+            answers["Q2"] = "yes"
+        else:  # every row present; some column profiles differ (see list)
+            answers["Q2"] = "partial"
         lines += [f"- tables replicated: {rep['tables']}, fidelity OK: **{rep['tables_fidelity_ok']}**",
                   f"- rows MySQL / Databricks: {rep['rows_mysql']} / {rep['rows_databricks']}",
                   f"- dbs missing in MySQL: {rep['missing_dbs_in_mysql'] or 'none'}"]
@@ -99,8 +105,15 @@ def build_report(runs_dir: str | Path = "runs/phase0") -> tuple[str, dict[str, A
     if gold:
         e = gold["eligibility"]
         answers["Q5"] = e.get("PRIMARY", 0) > 0
-        lines += [f"- PRIMARY (original gold SQL, result verified against MySQL): **{e.get('PRIMARY', 0)}**",
-                  f"- SECONDARY (validated adaptation, kept out of primary): {e.get('SECONDARY', 0)}",
+        src = {}
+        for r in gold.get("records", []):
+            if r["evaluation_eligibility"] == "PRIMARY":
+                k = (r["gold_source"] or "").split(":", 1)
+                key = "original gold SQL" if k[0] == "databricks_original_gold_sql" else f"adapted ({k[1] if len(k) > 1 else '?'})"
+                src[key] = src.get(key, 0) + 1
+        lines += [f"- PRIMARY (result verified against MySQL, the official engine): **{e.get('PRIMARY', 0)}**"]
+        lines += [f"  - {k}: {v}" for k, v in sorted(src.items())]
+        lines += [f"- SECONDARY (validated adaptation, kept out of primary): {e.get('SECONDARY', 0)}",
                   f"- EXCLUDED (counted, not deleted): {e.get('EXCLUDED', 0)}",
                   "- gold SQL text in benchmark.cases is the original BEAVER text; adaptations live only in "
                   "benchmark.gold_adaptations", ""]

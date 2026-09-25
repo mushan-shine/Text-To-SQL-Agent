@@ -173,7 +173,7 @@ def run_compatibility(cases: list[BeaverCase], mysql: Any, dbx: Any, layout: Lay
         write_rows(dbx, layout, layout.benchmark, "gold_adaptations", adapt_rows, tables.ADAPTATIONS)
     summary = summarize_compatibility(compat_rows, adapt_rows)
     summary["run_id"] = run_id
-    save_local("03_compatibility.json", {**summary, "records": compat_rows, "adaptations": adapt_rows})
+    save_local("03_compatibility.json", {**summary, "records": compat_rows, "adaptation_records": adapt_rows})
     return summary
 
 

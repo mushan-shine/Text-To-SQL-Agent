@@ -21,7 +21,7 @@
 | 2 | 重新登录 Databricks | 你 | ✅ | 2026-09-25 |
 | 3 | 配置 `.env`（MySQL 密码、智谱 key） | 你 | ✅ | 2026-09-25 |
 | 4 | 下载 BEAVER 数据库并导入 MySQL | 你 | ✅ | 2026-09-25 |
-| 5 | 运行 Phase 0 并评审报告 | Claude | 🔄 | |
+| 5 | 运行 Phase 0 并评审报告 | Claude | ✅ | 2026-09-25 |
 
 ---
 
@@ -159,9 +159,9 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 | 5.1 环境检查 | `phase0.py env` | catalog、schema、volume | 前置检查 | ✅ | catalog `self_healing_text2sql` 创建成功（不需要改用 `workspace`）；4 个 schema 和 staging volume 已建；DBSQL 2026.36；`UTF8_LCASE` 可用 |
 | 5.2 导入题库 | `phase0.py import` | `benchmark.cases`（100 个 case） | Q1 | ✅ | 从 dw 全部 5,787 题中按官方种子 77 抽样 100 题：复杂查询 43、领域复杂查询 48、领域查询 9；57 题含领域知识；每题 Gold 涉及 2–6 张表。`tables_meta` 97 行；`cases_agent_view` 已建。Gold SQL 大量使用窗口函数和多层 CTE，有 `VARIANCE`（MySQL 是总体方差，Databricks 是样本方差，属于潜在语义差异） |
 | 5.3 复制数据库 | `phase0.py replicate` | Databricks 里的 BEAVER 表、逐表核对报告 | Q2 | ✅ | 97 张表全部复制，行数一致（421,707 = 421,707），无零日期。95 张表逐列核对完全一致；2 张表的"不同值个数"差 1–6 个（`course_catalog_subject_offered.SUBJECT_DESCRIPTION`、`tip_material.TITLE / AUTHOR`）。原因已确认是**重音不敏感**：MySQL `utf8mb4_0900_ai_ci` 把 `Gödel`/`Godel`、`Gérard`/`Gerard` 视为同一个值，`UTF8_LCASE` 只忽略大小写（已知限制，共涉及 8 个值）。是否影响 Gold 结果由 5.4 判定 |
-| 5.4 兼容性验证 | `phase0.py compat` | 每条 Gold SQL 的兼容性分类 | Q3 | 🔄 按方案 B 重跑中 | **第 1 次（严格版，已归档为 `runs/phase0/03_compatibility_run1_strict.json`）** run `compat-20260925T062933-a95884`。**不改一个字直接执行：能执行 94/100，结果与 MySQL 一致 37/100。** 分类：COMPATIBLE 37、INCOMPATIBLE_SEMANTICS 57、UNKNOWN 6；两边结果各自重复执行都稳定。sqlglot 自动改写：0 条通过（47 条结果仍不同，16 条执行失败）。**57 条结果不同的原因（逐条复查）：** ① 37 条：MySQL 的 `VARIANCE/STD/STDDEV` 是**总体**统计量，Databricks 的同名函数是**样本**统计量；② 9 条：只是数字精度不同（MySQL `AVG`/除法只保留 4 位小数）；③ 11 条：窗口函数或 `LIMIT` 的排序键有并列值，并列行的先后顺序两个引擎处理不同（Gold 本身有歧义），另有日期解析差异等。**6 条 UNKNOWN：** 5 条是排名函数带了 `ROWS` 窗口帧（MySQL 忽略帧，Databricks 报错），1 条是 `UNION` 两边排序规则冲突（`UTF8_LCASE` 与普通 STRING），是我们环境设置带来的 |
-| 5.5 冻结 Gold | `phase0.py gold` | `benchmark.gold_results` | Q4、Q5 | ⬜ | |
-| 5.6 生成报告 | `phase0.py report` | `reports\phase0_report.md` | 汇总 | ⬜ | |
+| 5.4 兼容性验证 | `phase0.py compat` | 每条 Gold SQL 的兼容性分类 | Q3 | ✅ | **第 2 次（方案 B，正式结果）** run `compat-20260925T075328-c39909`：原始 Gold SQL 不改直接执行能跑通 94/100；**结果与 MySQL 一致 46/100**（新比较规则多认出 9 条只差数字精度的）。分类：COMPATIBLE 46、INCOMPATIBLE_SEMANTICS 48、INCOMPATIBLE_FUNCTION 5、INCOMPATIBLE_SCHEMA 1、UNKNOWN 0。规则改写后结果与 MySQL 一致 **43 条**（总体方差规则 38、窗口帧规则 5；包括之前卡住的 dw_4004）。**可用 89/100**；**排除 11 条**：6 条没有适用规则（并列值排序或日期解析导致结果不唯一：dw_4876、dw_817、dw_1737、dw_4522、dw_3868、dw_2443），4 条用了方差规则但结果仍不同（改写后仍受窗口并列值影响：dw_1616、dw_2394、dw_232、dw_4339），1 条 `UNION` 排序规则冲突（dw_1795）。<br>**第 1 次（严格版，已归档为 `runs/phase0/03_compatibility_run1_strict.json`）** run `compat-20260925T062933-a95884`。**不改一个字直接执行：能执行 94/100，结果与 MySQL 一致 37/100。** 分类：COMPATIBLE 37、INCOMPATIBLE_SEMANTICS 57、UNKNOWN 6；两边结果各自重复执行都稳定。sqlglot 自动改写：0 条通过（47 条结果仍不同，16 条执行失败）。**57 条结果不同的原因（逐条复查）：** ① 37 条：MySQL 的 `VARIANCE/STD/STDDEV` 是**总体**统计量，Databricks 的同名函数是**样本**统计量；② 9 条：只是数字精度不同（MySQL `AVG`/除法只保留 4 位小数）；③ 11 条：窗口函数或 `LIMIT` 的排序键有并列值，并列行的先后顺序两个引擎处理不同（Gold 本身有歧义），另有日期解析差异等。**6 条 UNKNOWN：** 5 条是排名函数带了 `ROWS` 窗口帧（MySQL 忽略帧，Databricks 报错），1 条是 `UNION` 两边排序规则冲突（`UTF8_LCASE` 与普通 STRING），是我们环境设置带来的 |
+| 5.5 冻结 Gold | `phase0.py gold` | `benchmark.gold_results` | Q4、Q5 | ✅ | run `gold-20260925T080708-5ee3bd`（基于 `compat-20260925T075328-c39909`），用新的数据库连接每条执行 3 次：**PRIMARY 89**（原始 Gold SQL 46 + 规则改写 43）、EXCLUDED 11；**漂移 0**；没有空结果；结果行数中位数 35，最多 130,080 |
+| 5.6 生成报告 | `phase0.py report` | `reports\phase0_report.md` | 汇总 | ✅ | 判定为**方案 B**。Q2 改为三档判定（yes / partial / no）；Q5 分开列出原始 SQL 和改写 SQL 的数量 |
 
 完整命令格式（把 `env` 换成对应步骤名）：
 
@@ -173,14 +173,14 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 
 | 问题 | 答案 |
 |---|---|
-| Q1 BEAVER Dataset 是否成功进入 Databricks？ | |
-| Q2 BEAVER Schema 是否能在 Databricks 中正确还原？ | |
-| Q3 多少 Gold SQL 可以直接在 Databricks 执行？ | |
-| Q4 Gold SQL 的执行结果是否稳定？ | |
-| Q5 能否在不修改 Ground Truth 的情况下完成 Evaluation？ | |
-| **方案判定（A / B / C）** | |
-| 可用于主评测（PRIMARY）的 case 数 | |
-| 是否进入 Phase 1 | |
+| Q1 BEAVER Dataset 是否成功进入 Databricks？ | ✅ **是**。100 个 case（dw，官方种子 77 抽样）写入 `benchmark.cases`，原始 Gold SQL 带指纹保存、拒绝覆盖；97 张表的结构信息写入 `tables_meta`；Agent 只能通过 `cases_agent_view` 读到 case_id / question / db |
+| Q2 BEAVER Schema 是否能在 Databricks 中正确还原？ | 🟡 **基本还原（partial）**。97/97 张表、421,707 行全部一致；95 张表逐列核对一致；2 张表的 3 个列（`course_catalog_subject_offered.SUBJECT_DESCRIPTION`、`tip_material.TITLE/AUTHOR`）有 8 个值因重音不敏感排序规则不同而去重结果不同（`UTF8_LCASE` 不忽略重音）。**100 个 case 的 Gold SQL 都没有用到这 3 个列，不影响评测** |
+| Q3 多少 Gold SQL 可以直接在 Databricks 执行？ | 不改直接执行能跑通 **94/100**；结果与 MySQL 一致 **46/100**。另有 43 条经两条有文档依据的规则改写后结果一致，共 **89/100 可用** |
+| Q4 Gold SQL 的执行结果是否稳定？ | ✅ **是**。同一次运行中两个引擎各执行 3 次，结果都一致；换新连接重新执行，89 条漂移为 0 |
+| Q5 能否在不修改 Ground Truth 的情况下完成 Evaluation？ | ✅ **是**。`benchmark.cases` 里的 Gold SQL 保持原文；改写只存在 `gold_adaptations` 里，并附规则名、文档链接和结果验证；89 条的冻结答案都经过和 MySQL 官方引擎的结果比对 |
+| **方案判定（A / B / C）** | **B**：部分 SQL 经过有文档依据、逐条验证的规则适配；11 条排除并计数 |
+| 可用于主评测（PRIMARY）的 case 数 | **89**（原始 46 + 改写 43）；排除 11 |
+| 是否进入 Phase 1 | ✅ 关卡一通过（89 ≥ 50），待你确认后进入 Phase 1 |
 
 ---
 
@@ -202,7 +202,8 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 | 4 | 2026-09-25 | 3 | 试调用智谱时 `UnicodeEncodeError: 'gbk' codec can't encode character '\U0001f44b'` | Windows 终端默认 GBK 编码，打印不了模型回复里的 emoji（调用本身是成功的） | `scripts/phase0.py` 启动时把 stdout/stderr 改为 UTF-8；其他脚本可设置环境变量 `PYTHONIOENCODING=utf-8` |
 | 5 | 2026-09-25 | 4.1 | 脚本列出了 `__MACOSX\beaver_db\._dw.sql` 等 6 个"dump" | 压缩包在 macOS 上生成，带资源分叉垃圾文件 | `fetch_beaver_db.py` 解压时跳过 `__MACOSX/`、`._*`、`.DS_Store`；已删除之前解压出的垃圾文件 |
 | 6 | 2026-09-25 | 5.4 | 按方案 B 重跑时停在 88/100，日志约 20 分钟没有更新；MySQL 和 Databricks 上都没有正在执行的查询 | 第 89 个 case（dw_4004）返回 15,881 行，结果不一致时比较代码逐行两两比较（O(n²)，约 2.5 亿次），CPU 一直在算 | 大分组改成先排序、再逐行对齐（O(n log n)），16k 行约 0.5–1.5 秒；停掉原进程后从头重跑 |
-| 7 | | | | | |
+| 7 | 2026-09-25 | 5.4 | `03_compatibility.json` 里的 `adaptations` 变成了改写明细列表，汇总统计丢失 | 保存本地文件时，明细和汇总用了同一个键名，明细覆盖了汇总（Delta 表不受影响） | 明细改存为 `adaptation_records`；已按原数据修复本次运行的 JSON 文件 |
+| 8 | | | | | |
 
 ---
 

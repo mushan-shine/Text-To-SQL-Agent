@@ -31,7 +31,7 @@
 
 | 阶段 | Phase | 在 Loop 中的角色 | 状态 |
 |---|---|---|---|
-| 一 可信基座 | 0 Benchmark Qualification | 裁判 | 🔄 代码完成，等待运行 |
+| 一 可信基座 | 0 Benchmark Qualification | 裁判 | ✅ 方案 B，89 个 PRIMARY case（2026-09-25） |
 | 二 基线与观测 | 1 Baseline · 2 Trace · 3 Failure Taxonomy | 起点、Observer 的数据、诊断的标准答案 | ⬜ |
 | 三 闭环本体 | 4 Diagnosis · 5 Repair Skills + Policy · 6 Controller + Verifier | 闭环本身 | ⬜ |
 | 四 实验证明 | 7 对照实验 · 8 消融 | 证明 | ⬜ |
