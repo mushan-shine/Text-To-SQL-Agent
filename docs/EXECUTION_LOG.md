@@ -206,7 +206,8 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 | 5 | 2026-09-25 | 4.1 | 脚本列出了 `__MACOSX\beaver_db\._dw.sql` 等 6 个"dump" | 压缩包在 macOS 上生成，带资源分叉垃圾文件 | `fetch_beaver_db.py` 解压时跳过 `__MACOSX/`、`._*`、`.DS_Store`；已删除之前解压出的垃圾文件 |
 | 6 | 2026-09-25 | 5.4 | 按方案 B 重跑时停在 88/100，日志约 20 分钟没有更新；MySQL 和 Databricks 上都没有正在执行的查询 | 第 89 个 case（dw_4004）返回 15,881 行，结果不一致时比较代码逐行两两比较（O(n²)，约 2.5 亿次），CPU 一直在算 | 大分组改成先排序、再逐行对齐（O(n log n)），16k 行约 0.5–1.5 秒；停掉原进程后从头重跑 |
 | 7 | 2026-09-25 | 5.4 | `03_compatibility.json` 里的 `adaptations` 变成了改写明细列表，汇总统计丢失 | 保存本地文件时，明细和汇总用了同一个键名，明细覆盖了汇总（Delta 表不受影响） | 明细改存为 `adaptation_records`；已按原数据修复本次运行的 JSON 文件 |
-| 8 | | | | | |
+| 8 | 2026-09-25 | 5.6b / 6 | dw_4188：SchemaSearch v2 确定性修复后 SQL 能执行，但返回 0 行；修复后的关联条件变成了 `sd.DEPARTMENT_CODE = sd.DEPARTMENT_CODE`、`ata.ACADEMIC_YEAR = ata.ACADEMIC_YEAR` | 错误的列引用正好在 JOIN ON 条件里，按"改到同一作用域里唯一拥有该列的表"修改后，它和等号另一侧变成了同一张表，关联条件恒为真，表之间失去关联（学期表和院系表本来就没有直接的关联键）。Phase 5 评测把它算成"报错 → 可执行"，统计虚高 | `fix_column_refs` 改完后检查所有"列 比较 列"的条件，改完后两边是同一个别名的就撤销，标记为"需要真正的关联键"，连同 schema 推断的候选关联键一起交给 LLM。补了 2 个回归测试。v2 结果归档为 `runs/phase5/repair-targeted-v2-tautology-bug.json`，Phase 6 的旧运行移到 `runs/phase6/_superseded/`，全部重跑 |
+| 9 | | | | | |
 
 ---
 
@@ -263,4 +264,24 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 | 5.5 | 测试 | ✅ | 新增 16 个，共 114 个。包括"skills / policy / diagnose / observer 不 import benchmark 或 evaluation 模块" |
 | 5.6 | 技能评测（开发集 30 个失败） | ✅ | 结果 `runs/phase5/repair-targeted-*.json`：**可执行 4 → 8，答对 0**。RetrieveAgain 14 题（报错 → 可执行 3/14）、SchemaSearch 11 题（2/9，其中 6 题确定性修复）、RepairSQL 3 题（0/3）、ReplanQuery 2 题（原本就能执行）。28 次 LLM 调用、33 万 token。**发现**：确定性改别名修好第一处错误后，同一条 SQL 常在下一处列引用再报错 → 需要一次修完所有能查到的列引用 |
 | 5.6b | SchemaSearch v2：一次修完所有能确定的列引用 | ✅ | `fix_column_refs` 按作用域检查每个带别名的列引用，列不在别名对应的表里、但同一作用域只有一张表有它时，改到那张表的别名；有歧义或找不到归属的，连同已修好一部分的 SQL 一起交给 LLM。**开发集可执行 8 → 10**；SchemaSearch 报错 → 可执行 2/9 → 4/9（dw_4188 一次确定性改了 3 处，不调用 LLM 就能执行）；LLM 调用 5 → 9（修不完的部分不再被丢下）；答对仍为 0。v1 结果归档为 `runs/phase5/repair-targeted-v1-single-fix.json`。测试 117 个 |
+| 5.6c | 修复问题 #8 后重跑（v3） | ✅ | 可执行 **4 → 8**（v2 有 bug 时是 10，其中 2 题的"可执行"是关联条件被改成恒真造成的，属于虚高）；SchemaSearch 报错 → 可执行 2/9；答对 0 |
 | 5.7 | 可视化报告 | ✅ | Phase 0–5 静态报告（含开发集 30 题逐题追踪、修复前后 SQL 对比）：https://claude.ai/artifact/GPw7xVDTVXBn3gidBHg2hr （私有；本地文件 `reports/loop_report.html`） |
+
+## Phase 6 · Loop Controller + Verifier + Generic Retry
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| 6.1 | Verifier `loop_engineer/verifier.py` | ✅ | **SelfVerifier**（主实验，不接触 Gold）：没生成 SQL、执行报错、结果行数超限、结果为空、某列全是 NULL。**OracleVerifier**（上界）：和 Gold 结果比对，结果一律标注为上界 |
+| 6.2 | Controller `loop_engineer/controller.py` | ✅ | 生成 → 执行 → 验证 →（不通过时）观察 → 诊断 → Policy → 修复 → 执行 → 验证，最多 2 次尝试。**targeted** 与 **generic**（Generic Retry：只把上一次的 SQL 和观察结果交回模型，要求"改正"，不诊断，不给额外 schema 信息）共用同一套控制逻辑。第 1 次尝试各组完全相同（命中 LLM 缓存）。预算按尝试次数计，诊断的 LLM 调用计入成本。最终答案：最后一次通过验证的 > 最后一次能执行的 > 最后一次 |
+| 6.3 | 指标 `evaluation/loop_run.py` | ✅ | 首次 / 最终准确率、恢复率、误伤率、净收益、平均尝试次数、额外 token、每净恢复一题的 token、Verifier 混淆矩阵（命中 / 误报 / 漏报）、各技能的恢复情况 |
+| 6.4 | 发布 | ✅ | `publish_run.py` 支持 Loop 运行：每次尝试一行 trace（含 Verifier、诊断、修复字段），评测表按尝试记录对错；MLflow 记录实验组参数和 Loop 指标。评测集运行必须显式加 `--eval` |
+| 6.5 | 开发集 4 个实验组（修复问题 #8 之后） | ✅ | 见下表。已发布到 Delta 和 MLflow。**4 组恢复都是 0**（开发集首次准确率 0/30，所以误伤率测不出；这是 D4 的已知后果） |
+
+| 实验组（开发集 30 题） | 可执行（第 1 次 → 最终） | 平均尝试 | 额外 token | Verifier：命中 / 漏报 / 误报 | 恢复 |
+|---|---|---|---|---|---|
+| Targeted Loop + Self | 4 → **9** | 1.9 | 36.96 万 | 27 / 3 / 0 | 0 |
+| Generic Retry + Self | 4 → 6 | 1.9 | 36.20 万 | 27 / 3 / 0 | 0 |
+| Targeted Loop + Oracle（上界） | 4 → **9** | 2.0 | 41.20 万 | 30 / 0 / 0 | 0 |
+| Generic Retry + Oracle（上界） | 4 → 6 | 2.0 | 40.17 万 | 30 / 0 / 0 | 0 |
+
+**解读**：token 成本相近时，Targeted Loop 让更多 SQL 变得可执行（9 vs 6），这是工程层面的差异；但 glm-4-flash 生成的 SQL 即使能执行，结果也不对，所以恢复都是 0，与干预实验的结论一致。SelfVerifier 在开发集上漏报 3 题（能执行但答错），Oracle 会把这 3 题也送去修复，但同样修不好。

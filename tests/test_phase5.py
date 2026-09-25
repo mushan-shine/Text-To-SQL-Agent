@@ -141,3 +141,39 @@ def test_loop_components_never_import_gold_or_evaluation(path):
     mods = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module} | \
            {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     assert not any(m.startswith(("benchmark", "evaluation")) for m in mods), (path, mods)
+
+
+def test_fix_never_turns_a_join_condition_into_a_self_comparison():
+    """Regression (dw_4188): re-pointing a wrong column inside ON made 'sd.X = sd.X' - the query ran,
+    but the tables were no longer related. Such references must be reverted and handed on."""
+    cat = SchemaCatalog.build("dw", [
+        ("academic_terms_all", "TERM_CODE", "STRING"), ("academic_terms_all", "ACADEMIC_YEAR", "STRING"),
+        ("sis_department", "DEPARTMENT_CODE", "STRING"), ("sis_department", "DEPARTMENT_NAME", "STRING"),
+        ("subject_offered", "TERM_CODE", "STRING"),
+    ], {})
+    sql = ("SELECT ata.ACADEMIC_YEAR, sd.DEPARTMENT_NAME, lib.ACADEMIC_YEAR AS y FROM ACADEMIC_TERMS_ALL ata "
+           "JOIN SIS_DEPARTMENT sd ON ata.DEPARTMENT_CODE = sd.DEPARTMENT_CODE "
+           "JOIN SUBJECT_OFFERED lib ON ata.TERM_CODE = lib.TERM_CODE AND ata.ACADEMIC_YEAR = lib.ACADEMIC_YEAR")
+    fix = fix_column_refs(sql, cat)
+    assert "sd.DEPARTMENT_CODE = sd.DEPARTMENT_CODE" not in fix.sql
+    assert "ata.ACADEMIC_YEAR = ata.ACADEMIC_YEAR" not in fix.sql
+    assert fix.changes == ["lib.ACADEMIC_YEAR -> ata.ACADEMIC_YEAR"]  # the SELECT reference is still fixed
+    assert sum("needs a real join key" in u for u in fix.unresolved) == 2
+
+
+def test_join_key_problems_reach_the_llm_with_schema_join_candidates():
+    cat = SchemaCatalog.build("dw", [
+        ("academic_terms_all", "TERM_CODE", "STRING"), ("sis_department", "DEPARTMENT_CODE", "STRING"),
+        ("subject_offered", "TERM_CODE", "STRING"),  # only sd owns DEPARTMENT_CODE (as in dw_4188)
+    ], {})
+    sql = ("SELECT 1 FROM ACADEMIC_TERMS_ALL ata JOIN SIS_DEPARTMENT sd ON ata.DEPARTMENT_CODE = sd.DEPARTMENT_CODE "
+           "JOIN SUBJECT_OFFERED s ON ata.TERM_CODE = s.TERM_CODE")
+    err = ("[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column ... with name `ata`.`DEPARTMENT_CODE` cannot be resolved. "
+           "Did you mean one of the following? [`sd`.`DEPARTMENT_CODE`].")
+    obs = observe({"case_id": "dw:1", "attempt_id": 1, "question": "q", "retrieved_tables":
+                   ["academic_terms_all", "sis_department", "subject_offered"], "generated_sql": sql,
+                   "parse_status": "OK", "execution_status": "ERROR", "execution_error": err}, "dw")
+    chat = Chat()
+    r = SchemaSearch().repair(obs, D.diagnose_by_rules(obs, cat), RepairContext(cat, chat))
+    assert r.used_llm and "needs a real join key" in chat.prompts[0]
+    assert "academic_terms_all.TERM_CODE = subject_offered.TERM_CODE" in chat.prompts[0]
