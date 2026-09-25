@@ -18,7 +18,7 @@ import hashlib
 import json
 import logging
 import os
-
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -64,6 +64,7 @@ class UsageMeter:
     input_tokens: int = 0
     output_tokens: int = 0
     cached_calls: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def check(self) -> None:
         if self.max_calls is not None and self.calls >= self.max_calls:
@@ -72,15 +73,17 @@ class UsageMeter:
             raise LlmBudgetExceeded(f"token budget exhausted ({self.input_tokens + self.output_tokens}/{self.max_tokens})")
 
     def record(self, r: LlmResponse) -> None:
-        if r.cached:
-            self.cached_calls += 1
-            return
-        self.calls += 1
-        self.input_tokens += r.input_tokens
-        self.output_tokens += r.output_tokens
+        with self._lock:  # safe under a thread pool
+            if r.cached:
+                self.cached_calls += 1
+                return
+            self.calls += 1
+            self.input_tokens += r.input_tokens
+            self.output_tokens += r.output_tokens
 
     def snapshot(self) -> dict[str, int]:
-        return {k: v for k, v in asdict(self).items() if not k.startswith("max_")}
+        return {"calls": self.calls, "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
+                "cached_calls": self.cached_calls}
 
 
 class ChatClient(Protocol):
@@ -173,6 +176,7 @@ class CachingChatClient:
 
     def __post_init__(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
         self._cache: dict[str, dict] = {}
         if self.path.exists():
             for line in self.path.read_text(encoding="utf-8").splitlines():
@@ -195,7 +199,8 @@ class CachingChatClient:
             self.inner.meter.record(r)
             return r
         r = self.inner.complete(prompt, system)
-        self._cache[key] = asdict(r)
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"key": key, "response": asdict(r)}, ensure_ascii=False) + "\n")
+        with self._lock:  # safe under a thread pool
+            self._cache[key] = asdict(r)
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"key": key, "response": asdict(r)}, ensure_ascii=False) + "\n")
         return r

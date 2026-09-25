@@ -95,12 +95,17 @@ def render_schema(catalog: SchemaCatalog, tables: tuple[str, ...]) -> str:
     return "\n\n".join(blocks)
 
 
-def build_prompt(task: AgentTask, schema_text: str, examples: list[FewShotExample]) -> str:
+def build_prompt(task: AgentTask, schema_text: str, examples: list[FewShotExample],
+                 oracle_hints: list[str] | None = None) -> str:
     parts = [RULES, "", "Schema:", schema_text, ""]
     if examples:
         parts.append("Examples (from the same warehouse):")
         for ex in examples:
             parts += [f"Question: {ex.question}", f"```sql\n{ex.sql}\n```", ""]
+    if oracle_hints:
+        parts.append("Verified facts about this question (use them):")
+        parts += [f"- {h}" for h in oracle_hints]
+        parts.append("")
     parts += [f"Question: {task.question}", "SQL:"]
     return "\n".join(parts)
 
@@ -122,8 +127,10 @@ class FewShotGenerator:
     catalog: SchemaCatalog
     examples: list[FewShotExample]
 
-    def generate(self, task: AgentTask, tables: tuple[str, ...]) -> Generation:
-        prompt = build_prompt(task, render_schema(self.catalog, tables), self.examples)
+    def generate(self, task: AgentTask, tables: tuple[str, ...], oracle_hints: list[str] | None = None) -> Generation:
+        """``oracle_hints`` carry GOLD annotations (BEAVER setting=1/2). Offline diagnostic analysis
+        only (evaluation/intervention.py) — the agent, loop and experiments never pass them."""
+        prompt = build_prompt(task, render_schema(self.catalog, tables), self.examples, oracle_hints)
         r = self.client.complete(prompt, system=SYSTEM)
         sql, status = extract_sql(r.text)
         return Generation(sql, r.text, status, r, prompt)

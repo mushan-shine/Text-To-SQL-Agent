@@ -87,3 +87,24 @@ def test_execution_and_unparseable(case):
 def test_priority_order():
     assert S.PRIORITY == (S.TABLE_RETRIEVAL, S.COLUMN_MAPPING, S.JOIN_KEY, S.DOMAIN_KNOWLEDGE,
                           S.QUERY_DECOMPOSITION, S.EXECUTION)
+
+
+def test_intervention_hints_and_classification(case):
+    from evaluation.intervention import MULTI_CAUSE, MULTIPLE_SUFFICIENT, UNRESOLVED, build_hints, classify
+    h = build_hints(case, SCHEMA)
+    assert set(h) == {"tables", "columns", "join_keys", "domain_knowledge"}  # single sub-question -> no decomposition
+    assert "academic_terms" not in h["tables"].lines[0]  # annotation-only table is not hinted
+    assert any("subject_offered.num_enrolled" in ln for ln in h["columns"].lines)
+    assert "Course 18" in h["domain_knowledge"].lines[0]
+    assert classify({"tables": False, "columns": True}, True) == (S.COLUMN_MAPPING, ["columns"])
+    assert classify({"tables": True, "columns": True}, True)[0] == MULTIPLE_SUFFICIENT
+    assert classify({"tables": False}, True)[0] == MULTI_CAUSE
+    assert classify({"tables": False}, False)[0] == UNRESOLVED
+
+
+def test_oracle_hints_only_appear_when_passed():
+    from agent.generator import build_prompt
+    from benchmark.beaver.dataset import AgentTask
+    t = AgentTask("dw:1", "q?", "dw")
+    assert "Verified facts" not in build_prompt(t, "TABLE x", [])
+    assert "- use t.a" in build_prompt(t, "TABLE x", [], oracle_hints=["use t.a"])
