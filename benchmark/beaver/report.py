@@ -19,13 +19,13 @@ def decide_architecture(compat: dict) -> tuple[str, str]:
     by = compat["by_status"]
     qualifiable = compat["cases"] - by.get(REFERENCE_FAILED, 0)
     ok = by.get(COMPATIBLE, 0)
-    rate = ok / qualifiable if qualifiable else 0.0
-    if rate >= 0.95:
+    usable = compat.get("usable_with_adaptations", ok)
+    if qualifiable and ok / qualifiable >= 0.95:
         return "A", f"{ok}/{qualifiable} qualifiable gold SQL reproduce the MySQL result unmodified"
-    if rate >= 0.70:
-        return "B", (f"{ok}/{qualifiable} compatible; remaining cases go through the Benchmark Adapter "
-                     "or are excluded and counted")
-    return "C", (f"only {ok}/{qualifiable} compatible — Execution Compatibility Boundary; keep BEAVER official "
+    if qualifiable and usable / qualifiable >= 0.70:
+        return "B", (f"{ok}/{qualifiable} compatible unmodified, {usable}/{qualifiable} usable with documented, "
+                     "result-validated Benchmark Adapter rules; the rest are excluded and counted")
+    return "C", (f"only {usable}/{qualifiable} usable — Execution Compatibility Boundary; keep BEAVER official "
                  "(MySQL) evaluation as reference and treat Databricks evaluation as a separate environment")
 
 
@@ -73,6 +73,9 @@ def build_report(runs_dir: str | Path = "runs/phase0") -> tuple[str, dict[str, A
                   "| status | cases |", "|---|---|"]
         lines += [f"| {k} | {v} |" for k, v in compat["by_status"].items()]
         lines += ["", f"- adapter outcomes: {compat['adaptations'] or 'none attempted'}",
+                  f"- result-equivalent adaptations by rule: {compat.get('adaptations_by_rule') or 'none'}",
+                  f"- usable (compatible + result-equivalent adaptations): "
+                  f"**{compat.get('usable_with_adaptations', compat['executes_and_matches_mysql'])}/{compat['cases']}**",
                   f"- static hazards (informational): {compat['static_hazards']}", "",
                   f"**Architecture decision: case {arch}** — {why}", ""]
     else:

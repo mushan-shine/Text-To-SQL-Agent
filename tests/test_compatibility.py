@@ -84,30 +84,68 @@ class TestValidateCase:
         assert "LIMIT_WITHOUT_ORDER_BY" in rec.static_hazards
 
 
-class TestAdapter:
-    def test_adaptation_validated_by_result_equivalence(self, make_case):
-        case = make_case("SELECT IFNULL(a, 0) FROM t")
-        adapted = adapter.transpile(case.gold_sql)
-        assert adapted and adapted != case.gold_sql
-        ref = FakeExecutor("mysql", {case.gold_sql: ok("mysql", [(0,)])})
+class TestAdapterRules:
+    def test_population_statistics(self):
+        sql = "SELECT STD(x), VARIANCE(y) OVER (PARTITION BY a), stddev(z), t.std, 'VARIANCE(' FROM t"
+        out, rules = adapter.apply_rules(sql)
+        assert rules == ["mysql_population_statistics"]
+        assert out == ("SELECT STDDEV_POP(x), VAR_POP(y) OVER (PARTITION BY a), STDDEV_POP(z), t.std, "
+                       "'VARIANCE(' FROM t")  # qualified names and string literals untouched
+
+    def test_sample_statistics_untouched(self):
+        sql = "SELECT VAR_SAMP(x), STDDEV_SAMP(y), VAR_POP(z) FROM t"
+        assert adapter.apply_rules(sql) == (sql, [])
+
+    def test_nonaggregate_frame_removed(self):
+        sql = ("SELECT RANK() OVER (PARTITION BY a ORDER BY b ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS r, "
+               "LAG(x, 1) OVER (ORDER BY b ROWS 2 PRECEDING) AS l, "
+               "SUM(x) OVER (ORDER BY b ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS s FROM t")
+        out, rules = adapter.apply_rules(sql)
+        assert rules == ["nonaggregate_window_frame_ignored"]
+        assert "RANK() OVER (PARTITION BY a ORDER BY b) AS r" in out
+        assert "LAG(x, 1) OVER (ORDER BY b) AS l" in out
+        # aggregate window functions keep their frame: there it is meaningful
+        assert "SUM(x) OVER (ORDER BY b ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS s" in out
+
+    def test_rules_combine(self):
+        out, rules = adapter.apply_rules("SELECT VARIANCE(x), ROW_NUMBER() OVER (ORDER BY y ROWS UNBOUNDED PRECEDING) FROM t")
+        assert set(rules) == {"mysql_population_statistics", "nonaggregate_window_frame_ignored"}
+        assert out == "SELECT VAR_POP(x), ROW_NUMBER() OVER (ORDER BY y) FROM t"
+
+
+class TestAdapterValidation:
+    def _ref_runs(self, case, rows):
+        ref = FakeExecutor("mysql", {case.gold_sql: ok("mysql", rows)})
         _, ref_runs, _ = validate_case(case, ref, FakeExecutor("databricks", {case.gold_sql: err("databricks", "X")}))
-        cand = FakeExecutor("databricks", {adapted: ok("databricks", [(0,)])})
-        rec = adapter.try_adapt(case, ref_runs, cand, repeats=2)
+        return ref_runs
+
+    def test_adaptation_validated_by_result_equivalence(self, make_case):
+        case = make_case("SELECT VARIANCE(a) FROM t")
+        adapted, _ = adapter.apply_rules(case.gold_sql)
+        cand = FakeExecutor("databricks", {adapted: ok("databricks", [(2.25,)])})
+        rec = adapter.try_adapt(case, self._ref_runs(case, [(2.25,)]), cand, repeats=2)
         assert rec.semantic_validation == adapter.RESULT_EQUIVALENT
+        assert rec.adaptation_rule == "mysql_population_statistics"
+        assert rec.adapted_result_hash and "dev.mysql.com" in rec.detail
         assert rec.original_gold_sql == case.gold_sql  # original is never modified
 
     def test_adaptation_rejected_when_result_differs(self, make_case):
-        case = make_case("SELECT IFNULL(a, 0) FROM t")
-        adapted = adapter.transpile(case.gold_sql)
-        ref = FakeExecutor("mysql", {case.gold_sql: ok("mysql", [(0,)])})
-        _, ref_runs, _ = validate_case(case, ref, FakeExecutor("databricks", {case.gold_sql: err("databricks", "X")}))
-        rec = adapter.try_adapt(case, ref_runs, FakeExecutor("databricks", {adapted: ok("databricks", [(9,)])}), 2)
+        case = make_case("SELECT VARIANCE(a) FROM t")
+        adapted, _ = adapter.apply_rules(case.gold_sql)
+        rec = adapter.try_adapt(case, self._ref_runs(case, [(2.25,)]),
+                                FakeExecutor("databricks", {adapted: ok("databricks", [(3.0,)])}), 2)
         assert rec.semantic_validation == adapter.RESULT_DIFFERS
 
-    def test_no_adaptation_when_text_unchanged(self, make_case):
+    def test_no_adaptation_when_no_rule_applies(self, make_case):
         case = make_case("SELECT a FROM t")
         rec = adapter.try_adapt(case, None, FakeExecutor("databricks", {}), 1)  # type: ignore[arg-type]
         assert rec.semantic_validation == adapter.NO_ADAPTATION
+
+
+def test_window_frame_error_is_function_incompatibility():
+    msg = "Window Frame specifiedwindowframe(RowFrame, -2, currentrow$()) must match the required frame"
+    assert classify_error(None, msg) == C.INCOMPATIBLE_FUNCTION
+    assert classify_error("INCOMPATIBLE_COLUMN_TYPE", "") == C.INCOMPATIBLE_SCHEMA
 
 
 def test_execution_result_ok_flag():

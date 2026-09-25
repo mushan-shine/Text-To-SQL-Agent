@@ -20,7 +20,7 @@ import sqlglot
 from sqlglot import exp
 
 from benchmark.beaver.dataset import BeaverCase
-from benchmark.beaver.evaluator import canonical_match, result_hash
+from benchmark.beaver.evaluator import cross_engine_match, result_hash
 from execution.base import ExecutionResult, SqlExecutor
 
 log = logging.getLogger(__name__)
@@ -42,7 +42,9 @@ _SYNTAX = ("PARSE_SYNTAX_ERROR", "PARSE_EMPTY_STATEMENT", "INVALID_IDENTIFIER", 
 _FUNCTION = ("UNRESOLVED_ROUTINE", "WRONG_NUM_ARGS", "DATATYPE_MISMATCH", "INVALID_PARAMETER_VALUE",
              "INVALID_FORMAT", "COLLATION_MISMATCH", "UNSUPPORTED_COLLATION")
 _SCHEMA = ("TABLE_OR_VIEW_NOT_FOUND", "UNRESOLVED_COLUMN", "SCHEMA_NOT_FOUND", "AMBIGUOUS_REFERENCE",
-           "AMBIGUOUS_COLUMN_OR_FIELD", "FIELD_NOT_FOUND", "UNRESOLVED_FIELD")
+           "AMBIGUOUS_COLUMN_OR_FIELD", "FIELD_NOT_FOUND", "UNRESOLVED_FIELD",
+           # e.g. UNION of a UTF8_LCASE column with an untyped literal: caused by the replicated schema
+           "INCOMPATIBLE_COLUMN_TYPE")
 # Errors caused by a *semantic* difference between engines (MySQL would have
 # returned something; Databricks refuses or computes differently).
 _SEMANTICS = ("MISSING_AGGREGATION", "MISSING_GROUP_BY", "DIVIDE_BY_ZERO", "CAST_INVALID_INPUT",
@@ -58,7 +60,8 @@ def classify_error(error_class: str | None, message: str | None) -> str:
         return INCOMPATIBLE_SYNTAX
     if head in _SCHEMA:
         return INCOMPATIBLE_SCHEMA
-    if head in _FUNCTION or "undefined function" in msg:
+    # Spark raises this without an error class for RANK()/ROW_NUMBER()/LAG() ... OVER (... ROWS ...)
+    if head in _FUNCTION or "undefined function" in msg or "window frame" in msg:
         return INCOMPATIBLE_FUNCTION
     if head in _SEMANTICS or head.startswith("DATETIME_") or head.startswith("CAST_"):
         return INCOMPATIBLE_SEMANTICS
@@ -172,7 +175,7 @@ def validate_case(case: BeaverCase, reference: SqlExecutor, candidate: SqlExecut
                   repeats: int = 3) -> tuple[CompatibilityRecord, EngineRuns, EngineRuns]:
     ref = run_repeated(reference, case.gold_sql, case.db, repeats)
     cand = run_repeated(candidate, case.gold_sql, case.db, repeats)
-    cmp = canonical_match(cand.rows, ref.rows) if ref.status == cand.status == "SUCCESS" else None
+    cmp = cross_engine_match(cand.rows, ref.rows) if ref.status == cand.status == "SUCCESS" else None
 
     if ref.status != "SUCCESS":
         status, reason = REFERENCE_FAILED, f"gold SQL fails on reference engine: {ref.status} {ref.error_class}"

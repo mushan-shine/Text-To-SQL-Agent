@@ -40,7 +40,9 @@ COMPATIBILITY = pa.schema([
 
 ADAPTATIONS = pa.schema([
     ("run_id", S), ("case_id", S), ("original_gold_sql", S), ("adapted_sql", S),
-    ("adaptation_rule", S), ("semantic_validation", S), ("detail", S), ("created_at", T),
+    ("adaptation_rule", S), ("semantic_validation", S), ("detail", S),
+    ("adapted_result_hash", S),  # Databricks result hash of the adapted SQL (drift reference)
+    ("created_at", T),
 ])
 
 GOLD_RESULTS = pa.schema([

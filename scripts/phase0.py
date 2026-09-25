@@ -20,6 +20,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
+# Windows consoles default to GBK, which cannot print emoji / some model output.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 import yaml  # noqa: E402
 
@@ -183,6 +187,8 @@ def main() -> None:
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if not args.verbose:  # the SQL connector logs every HTTP round trip at INFO
+        logging.getLogger("databricks").setLevel(logging.WARNING)
     load_dotenv(ROOT / ".env")
     cfg = load_config(Path(args.config), args)
 
