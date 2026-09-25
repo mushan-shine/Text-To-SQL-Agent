@@ -251,3 +251,16 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 | 4.1 | Observer `loop_engineer/observer.py` | ✅ | 按**白名单**从 trace 取字段（问题、检索到的表、SQL、执行状态 / 报错 / 结果预览），correct、eval_\*、Gold 字段都进不来（有测试保证）。同时从报错文本解析出信号：错误类别、无法解析的列及其别名、Databricks 给出的列名建议、不存在的表 |
 | 4.2 | Diagnoser `loop_engineer/diagnose.py`（`diagnoser-v1`） | ✅ | **规则级**：报错某列无法解析时，到 schema 里查这一列属于哪张表 → 在 SQL 已用的表里 = 列映射（别名挂错）；在已检索但没用上的表里 = 选表（表没用上）；只在未检索到的表里 = 选表（检索遗漏）；哪里都没有 = 列映射（编造列名）。表不存在 → 选表；语法 / 聚合 / 窗口等报错 → 执行；结果行数超限 → 关联键。**LLM 级**：只在没有明确报错信号时调用（SQL 能执行但结果可疑），要求输出严格 JSON。同时输出**修复线索**（repair_hints）供 Phase 5 使用。结果共享 `agent/sql_analysis.py`（从 Phase 3 标注器中拆出的中性模块）。测试 10 个 |
 | 4.3 | 诊断准确率 `evaluation/diagnosis_eval.py` | ✅ | 严格口径 = 诊断结果等于标签主因；宽松口径 = 诊断结果在所有未通过的检查里。**开发集（30）**：严格 53.3%、宽松 56.7%；规则级 26 题：严格 61.5% / 宽松 65.4%；LLM 级 0/4。**评测集（87，冻结后只跑一次）**：**严格 40.2%、宽松 66.7%**；规则级 68 题：严格 51.5% / **宽松 76.5%**；LLM 级 19 题：严格 0/19、宽松 6/19。最大的混淆是"选表 → 列映射"（31 题）：诊断只看到直接报错（列挂错了别名），标注器看的是整体结构（还少用了表），即根因和直接原因不一致。LLM 级在 glm-4-flash 上基本无效，而且答错时置信度更高（0.84 vs 0.82）。已发布到 `traces.diagnoses`（Agent 侧）和 `evaluation.diagnosis_eval`（评测侧） |
+
+## Phase 5 · Repair Skills + Policy
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| 5.1 | Policy `loop_engineer/policy.py` | ✅ | 诊断到技能的映射写成配置：选表 → RetrieveAgain，列映射 → SchemaSearch，关联键 → FindJoinPath，查询拆解 → ReplanQuery，执行错误 / 未知 → RepairSQL；领域知识**临时**走 ReplanQuery（记为 fallback）。支持 `generic`（全部走 RepairSQL）和逐个禁用技能，供 Phase 8 消融 |
+| 5.2 | 修复技能 `skills/*.py` | ✅ | SchemaSearch：别名挂错时**确定性**改写语法树（不调用 LLM），编造列名时把引擎建议和相似列名交给 LLM；RetrieveAgain：补上拥有该列的表，并附上从 schema 推断的关联条件；FindJoinPath：列出共享键列，让 LLM 核对关联条件；ReplanQuery：拆成子问题 / CTE；RepairSQL：带报错信息做最小修改，附 Databricks 语法限制说明 |
+| 5.3 | 关联信息来源 | ✅ | `agent/join_graph.py`：只从 schema 推断（同名的 `*_CODE / *_KEY / *_ID` 键列），不用 BEAVER join_keys |
+| 5.4 | 领域知识来源 | ⏸ | RetrieveKnowledge 未实现，等待确定不属于 Gold 的知识来源（值定位 / 非评测题整理出的术语表） |
+| 5.5 | 测试 | ✅ | 新增 16 个，共 114 个。包括"skills / policy / diagnose / observer 不 import benchmark 或 evaluation 模块" |
+| 5.6 | 技能评测（开发集 30 个失败） | ✅ | 结果 `runs/phase5/repair-targeted-*.json`：**可执行 4 → 8，答对 0**。RetrieveAgain 14 题（报错 → 可执行 3/14）、SchemaSearch 11 题（2/9，其中 6 题确定性修复）、RepairSQL 3 题（0/3）、ReplanQuery 2 题（原本就能执行）。28 次 LLM 调用、33 万 token。**发现**：确定性改别名修好第一处错误后，同一条 SQL 常在下一处列引用再报错 → 需要一次修完所有能查到的列引用 |
+| 5.6b | SchemaSearch v2：一次修完所有能确定的列引用 | ✅ | `fix_column_refs` 按作用域检查每个带别名的列引用，列不在别名对应的表里、但同一作用域只有一张表有它时，改到那张表的别名；有歧义或找不到归属的，连同已修好一部分的 SQL 一起交给 LLM。**开发集可执行 8 → 10**；SchemaSearch 报错 → 可执行 2/9 → 4/9（dw_4188 一次确定性改了 3 处，不调用 LLM 就能执行）；LLM 调用 5 → 9（修不完的部分不再被丢下）；答对仍为 0。v1 结果归档为 `runs/phase5/repair-targeted-v1-single-fix.json`。测试 117 个 |
+| 5.7 | 可视化报告 | ✅ | Phase 0–5 静态报告（含开发集 30 题逐题追踪、修复前后 SQL 对比）：https://claude.ai/artifact/GPw7xVDTVXBn3gidBHg2hr （私有；本地文件 `reports/loop_report.html`） |
