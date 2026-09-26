@@ -5,7 +5,7 @@ Research question: when a Text-to-SQL agent produces wrong SQL, can the system
 a generic retry that uses the same budget? BEAVER is the benchmark, Databricks
 is the platform, and loop engineering is the actual contribution.
 
-This is a **Loop Engineering** project. Text-to-SQL is only the test vehicle. Loop design, background, value and interview narrative: [docs/PROJECT_POSITIONING.md](docs/PROJECT_POSITIONING.md). Step-by-step execution plan: [docs/ROADMAP.md](docs/ROADMAP.md). Execution record: [docs/EXECUTION_LOG.md](docs/EXECUTION_LOG.md).
+This is a **Loop Engineering** project. Text-to-SQL is only the test vehicle. Loop design, background, value and interview narrative: [docs/PROJECT_POSITIONING.md](docs/PROJECT_POSITIONING.md). Step-by-step execution plan: [docs/ROADMAP.md](docs/ROADMAP.md). How the loop works (flow, trace, context, skills, design rationale): [docs/LOOP_DESIGN.md](docs/LOOP_DESIGN.md). Execution record: [docs/EXECUTION_LOG.md](docs/EXECUTION_LOG.md).
 
 **Status: Phase 0 (BEAVER → Databricks qualification).** No agent code exists
 yet. The strict phase order is in the project brief.

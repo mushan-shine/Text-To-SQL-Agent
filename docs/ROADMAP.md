@@ -34,7 +34,7 @@
 | 一 可信基座 | 0 Benchmark Qualification | 裁判 | ✅ 方案 B，89 个 PRIMARY case（2026-09-25） |
 | 二 基线与观测 | 1 Baseline · 2 Trace · 3 Failure Taxonomy | 起点、Observer 的数据、诊断的标准答案 | ⬜ |
 | 三 闭环本体 | 4 Diagnosis · 5 Repair Skills + Policy · 6 Controller + Verifier | 闭环本身 | ⬜ |
-| 四 实验证明 | 7 对照实验 · 8 消融 | 证明 | ⬜ |
+| 四 实验证明 | 7 对照实验 · 8 消融 | 证明 | ⏭ 不做（决策 D5，代码已支持） |
 | 五 展示与交付 | 9 Loop Debug Console · 作品集材料 | 展示 | ⬜ |
 | 六 外层循环 | 10 Experience Store · 11 Learning Loop · 12 Regression | 自我改进 | ⬜ 加分项 |
 
