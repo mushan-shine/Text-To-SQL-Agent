@@ -85,7 +85,9 @@ def classify(single: dict[str, bool], all_hints: bool | None) -> tuple[str, list
 
 def run_intervention(cases: list[BeaverCase], retrieved: dict[str, list[str]], generator: FewShotGenerator,
                      executor: Any, judges: dict[str, Callable], schema: dict[str, dict[str, str]],
-                     catalog_tables: set[str], workers: int = 4, max_rows: int = 500_000) -> list[dict]:
+                     catalog_tables: set[str], workers: int = 4, max_rows: int = 500_000,
+                     only: set[str] | None = None) -> list[dict]:
+    """``only``: run just these variants (e.g. {"all"} for a cheap upper-bound probe of a new model)."""
     # 1) prompts for every (case, variant)
     jobs = []
     for c in cases:
@@ -95,6 +97,8 @@ def run_intervention(cases: list[BeaverCase], retrieved: dict[str, list[str]], g
             variants["all"] = Hint([ln for h in variants.values() for ln in h.lines],
                                    set().union(*(h.tables for h in variants.values())))
         for name, h in variants.items():
+            if only and name not in only:
+                continue
             tables = list(retrieved[c.case_id]) + sorted(t for t in h.tables if t in catalog_tables
                                                          and t not in retrieved[c.case_id])
             jobs.append((c, name, h, tuple(tables)))

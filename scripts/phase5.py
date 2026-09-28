@@ -25,7 +25,7 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
 from agent.generator import select_few_shot  # noqa: E402
-from agent.llm import CachingChatClient, UsageMeter, ZhipuChatClient  # noqa: E402
+from agent.llm import CachingChatClient, UsageMeter, make_client  # noqa: E402
 from agent.retriever import SchemaCatalog  # noqa: E402
 from benchmark.beaver.loader import load_cases, load_from_local_json  # noqa: E402
 from evaluation.devset import dev_judges, load_devset  # noqa: E402
@@ -62,8 +62,8 @@ def main() -> None:
                                                                int(b["sample_seed"]), b["local_dir"])[0]}
     examples = select_few_shot(queries, eval_ids, int(fs["n_examples"]), int(fs["seed"]), int(fs["max_tables"]),
                                int(fs["max_sql_chars"]))
-    inner = ZhipuChatClient.from_env(max_output_tokens=int(lc["max_output_tokens"]), meter=UsageMeter(max_calls=200))
-    inner.model = meta["model"]
+    inner = make_client(model=meta["model"], max_output_tokens=int(lc["max_output_tokens"]),
+                        meter=UsageMeter(max_calls=200))
     client = CachingChatClient(inner, Path(lc["cache"]))
     diagnoser, policy = Diagnoser(catalog, client), Policy(mode=args.policy)
     ctx = RepairContext(catalog, client, examples)

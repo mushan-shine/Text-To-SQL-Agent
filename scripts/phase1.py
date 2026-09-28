@@ -25,7 +25,7 @@ for _stream in (sys.stdout, sys.stderr):
 import yaml  # noqa: E402
 
 from agent.generator import FewShotGenerator, select_few_shot  # noqa: E402
-from agent.llm import CachingChatClient, UsageMeter, ZhipuChatClient  # noqa: E402
+from agent.llm import CachingChatClient, UsageMeter, make_client  # noqa: E402
 from agent.retriever import BM25TableRetriever, SchemaCatalog  # noqa: E402
 from benchmark.beaver.loader import load_cases, load_from_local_json  # noqa: E402
 from evaluation.baseline import BaselineConfig, gold_judge, run_baseline, select_pilot  # noqa: E402
@@ -133,9 +133,7 @@ def main() -> None:
 
     catalog = load_catalog(dbx, cfg, tables_meta)
     meter = UsageMeter(max_calls=int(lc["max_calls"]), max_tokens=int(lc["max_tokens"]))
-    client = ZhipuChatClient.from_env(max_output_tokens=int(lc["max_output_tokens"]), meter=meter)
-    if not os.environ.get("ZHIPU_MODEL"):
-        client.model = lc["model"]
+    client = make_client(lc, max_output_tokens=int(lc["max_output_tokens"]), meter=meter)
     chat = client if args.no_cache else CachingChatClient(client, Path(lc["cache"]))
     generator = FewShotGenerator(chat, catalog, examples)
     retriever = BM25TableRetriever(catalog)
@@ -145,7 +143,7 @@ def main() -> None:
     run_id, summary = run_baseline(
         selected, judges, retriever, generator, dbx,
         BaselineConfig(top_k=int(cfg["retrieval"]["top_k"]), max_result_rows=int(cfg["databricks"]["max_result_rows"])),
-        RUNS, {"mode": args.mode, "model": client.model, "config": cfg, "case_ids": [c.case_id for c in selected]})
+        RUNS, {"mode": args.mode, "model": client.model, "provider": client.provider, "config": cfg, "case_ids": [c.case_id for c in selected]})
     summary["llm_usage"] = meter.snapshot()
     (RUNS / run_id / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     dbx.close()

@@ -145,3 +145,23 @@ def test_loop_records_flatten_to_one_trace_row_per_attempt():
     assert [e["correct"] for e in rows["evaluation_results"]] == [False, True]
     assert rows["runs"][0]["correct"] == 1 and rows["runs"][0]["executable_rate"] == 1.0
     assert mlflow_params(meta, summary)["arm"] == "targeted-self" and mlflow_metrics(summary)["net_gain"] == 1.0
+
+
+def test_events_follow_the_loop_steps_and_do_not_change_results():
+    events = []
+    chat = Chat(lambda n: f"```sql\n{BAD}\n```")
+    res = controller(chat).run(TASK, SelfVerifier(), on_event=lambda step, p: events.append((step, p)))
+    assert [s for s, _ in events] == ["retrieve", "generate", "execute", "verify", "diagnose", "route", "repair",
+                                      "execute", "verify", "final"]
+    d = dict(events)
+    assert d["diagnose"]["failure_type"] == "COLUMN_MAPPING_FAILURE" and d["route"]["skill"] == "SchemaSearch"
+    assert d["repair"]["before_sql"] == BAD and d["final"]["final_attempt"] == 2
+    plain = controller(Chat(lambda n: f"```sql\n{BAD}\n```")).run(TASK, SelfVerifier())
+    assert [a["generated_sql"] for a in plain.attempts] == [a["generated_sql"] for a in res.attempts]
+
+
+def test_a_failing_event_callback_never_breaks_the_loop():
+    def boom(step, payload):
+        raise RuntimeError("ui crashed")
+    res = controller(Chat(lambda n: f"```sql\n{BAD}\n```")).run(TASK, SelfVerifier(), on_event=boom)
+    assert res.attempts[-1]["verifier_decision"] == "PASS"

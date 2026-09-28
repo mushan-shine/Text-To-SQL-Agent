@@ -1,4 +1,8 @@
-"""LLM client — Zhipu open platform (OpenAI-compatible chat completions).
+"""LLM client — OpenAI-compatible chat completions, one class for several providers.
+
+Providers (``PROVIDERS``): ``zhipu`` (open.bigmodel.cn, glm-*) and ``deepseek``
+(api.deepseek.com, deepseek-*). Same protocol; they differ only in base URL,
+key variable and how deterministic decoding is requested (decision D6).
 
 Experiment requirements (docs/PROJECT_POSITIONING.md §7):
 * greedy decoding (``do_sample=False``): the same prompt must give the same answer,
@@ -29,6 +33,7 @@ import requests
 log = logging.getLogger(__name__)
 
 ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "glm-4-flash"
 RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
@@ -86,43 +91,82 @@ class UsageMeter:
                 "cached_calls": self.cached_calls}
 
 
+@dataclass(frozen=True)
+class Provider:
+    name: str
+    base_url: str
+    key_env: str                    # .env variable holding the API key
+    default_model: str
+    greedy: dict[str, Any]          # request fields for deterministic decoding
+    model_prefixes: tuple[str, ...]
+
+
+PROVIDERS = {
+    # do_sample=False is true greedy decoding. Kept identical to the original client so
+    # existing cache entries (the fingerprint includes params) still hit.
+    "zhipu": Provider("zhipu", ZHIPU_BASE_URL, "ZHIPUAI_API_KEY", "glm-4-flash", {"do_sample": False}, ("glm",)),
+    # Pinned id, not the "deepseek-chat" alias (the platform re-points aliases; in 2026-09 it
+    # served deepseek-flash = DeepSeek-V4.1-Flash). Thinking is ON by default and ignores
+    # temperature, so it is disabled explicitly; temperature=0 is then the closest to greedy
+    # (not guaranteed bit-exact: the on-disk cache is what makes arms share attempt 1).
+    "deepseek": Provider("deepseek", DEEPSEEK_BASE_URL, "DEEPSEEK_API_KEY", "deepseek-flash",
+                         {"temperature": 0.0, "thinking": {"type": "disabled"}}, ("deepseek",)),
+}
+
+
 class ChatClient(Protocol):
     model: str
 
     def complete(self, prompt: str, system: str | None = None) -> LlmResponse: ...
 
 
-def check_api_key(key: str) -> str:
+def provider_for_model(model: str) -> str:
+    for p in PROVIDERS.values():
+        if model.lower().startswith(p.model_prefixes):
+            return p.name
+    raise LlmError(f"cannot tell the provider of model {model!r}; set llm.provider / LLM_PROVIDER")
+
+
+def check_api_key(key: str, env_name: str = "ZHIPUAI_API_KEY") -> str:
     bad = [f"U+{ord(c):04X}" for c in key if ord(c) < 32 or ord(c) == 127]
     if bad:
         raise LlmError(f"API key contains {len(bad)} invisible control character(s) ({', '.join(bad)}); "
                        "re-enter it without Ctrl+V into a hidden prompt")
     if not key.strip():
-        raise LlmError("API key is empty (set ZHIPUAI_API_KEY in .env)")
+        raise LlmError(f"API key is empty (set {env_name} in .env)")
     return key.strip()
 
 
 @dataclass
-class ZhipuChatClient:
+class OpenAICompatibleChatClient:
     api_key: str = field(repr=False)
     model: str = DEFAULT_MODEL
-    base_url: str = ZHIPU_BASE_URL
+    provider: str = "zhipu"
+    base_url: str | None = None           # None = the provider's
     max_output_tokens: int = 2048
     timeout_s: float = 120.0
     max_retries: int = 5
     meter: UsageMeter = field(default_factory=UsageMeter)
 
     def __post_init__(self) -> None:
-        self.api_key = check_api_key(self.api_key)
+        if self.provider not in PROVIDERS:
+            raise LlmError(f"unknown provider {self.provider!r}; known: {', '.join(PROVIDERS)}")
+        self.base_url = self.base_url or PROVIDERS[self.provider].base_url
+        self.api_key = check_api_key(self.api_key, PROVIDERS[self.provider].key_env)
 
     @classmethod
-    def from_env(cls, env: dict[str, str] | None = None, **kw: Any) -> "ZhipuChatClient":
+    def from_env(cls, env: dict[str, str] | None = None, provider: str = "zhipu", model: str | None = None,
+                 **kw: Any) -> "OpenAICompatibleChatClient":
+        """Model: LLM_MODEL (or legacy ZHIPU_MODEL for zhipu) > ``model`` > the provider default."""
         env = dict(os.environ) if env is None else env
-        return cls(api_key=env.get("ZHIPUAI_API_KEY", ""), model=env.get("ZHIPU_MODEL", DEFAULT_MODEL).strip(), **kw)
+        p = PROVIDERS[provider]
+        legacy = env.get("ZHIPU_MODEL") if provider == "zhipu" else None
+        chosen = (env.get("LLM_MODEL") or legacy or model or p.default_model).strip()
+        return cls(api_key=env.get(p.key_env, ""), model=chosen, provider=provider, **kw)
 
     @property
     def params(self) -> dict[str, Any]:
-        return {"do_sample": False, "max_tokens": self.max_output_tokens}
+        return {**PROVIDERS[self.provider].greedy, "max_tokens": self.max_output_tokens}
 
     def complete(self, prompt: str, system: str | None = None) -> LlmResponse:
         self.meter.check()
@@ -140,7 +184,7 @@ class ZhipuChatClient:
                 continue
             latency = int((time.perf_counter() - t0) * 1000)
             if resp.status_code in RETRYABLE_STATUS and attempt < self.max_retries:
-                log.warning("zhipu HTTP %s, retry %d", resp.status_code, attempt + 1)
+                log.warning("%s HTTP %s, retry %d", self.provider, resp.status_code, attempt + 1)
                 _backoff(attempt)
                 continue
             if resp.status_code != 200:
@@ -157,6 +201,29 @@ class ZhipuChatClient:
         raise LlmError("unreachable")
 
 
+ZhipuChatClient = OpenAICompatibleChatClient  # backwards-compatible name
+
+
+def make_client(llm_cfg: dict[str, Any] | None = None, model: str | None = None,
+                env: dict[str, str] | None = None, **kw: Any) -> OpenAICompatibleChatClient:
+    """Build the client from config or from a pinned model.
+
+    * ``model`` given (replaying a recorded run): exactly that model; provider inferred from its name.
+    * otherwise ``LLM_PROVIDER`` overrides ``llm.provider``; model as in ``from_env``.
+    """
+    env = dict(os.environ) if env is None else env
+    if model:
+        p = PROVIDERS[provider_for_model(model)]
+        return OpenAICompatibleChatClient(api_key=env.get(p.key_env, ""), model=model, provider=p.name, **kw)
+    cfg = llm_cfg or {}
+    provider = (env.get("LLM_PROVIDER") or cfg.get("provider") or "zhipu").strip()
+    if provider not in PROVIDERS:
+        raise LlmError(f"unknown provider {provider!r}; known: {', '.join(PROVIDERS)}")
+    # llm.model belongs to llm.provider: when LLM_PROVIDER switches provider, use that provider's default
+    cfg_model = cfg.get("model") if cfg.get("provider", "zhipu") == provider else None
+    return OpenAICompatibleChatClient.from_env(env, provider=provider, model=cfg_model, **kw)
+
+
 def _backoff(attempt: int, base: float = 1.0, cap: float = 30.0) -> None:
     time.sleep(min(cap, base * 2 ** attempt))
 
@@ -171,7 +238,7 @@ def prompt_fingerprint(model: str, params: dict[str, Any], system: str | None, p
 class CachingChatClient:
     """Replays responses for identical (model, params, system, prompt)."""
 
-    inner: ZhipuChatClient
+    inner: OpenAICompatibleChatClient
     path: Path
 
     def __post_init__(self) -> None:

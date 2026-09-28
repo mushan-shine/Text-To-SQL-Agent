@@ -33,7 +33,10 @@ def _tokens(a: dict) -> int:
 
 
 def run_arm(cases: list[BeaverCase], judges: dict[str, Callable], controller: LoopController,
-            verifier_for: Callable[[str], Any], arm: str, out_root: Path, meta: dict) -> tuple[str, dict]:
+            verifier_for: Callable[[str], Any], arm: str, out_root: Path, meta: dict,
+            on_event: Callable[[str, str, dict], None] | None = None) -> tuple[str, dict]:
+    """``on_event(case_id, step, payload)``: live progress for UIs. The ``judged`` step comes from
+    the evaluation side, after the loop for that case has finished."""
     run_id = f"{arm}-{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:6]}"
     out = out_root / run_id
     out.mkdir(parents=True, exist_ok=True)
@@ -42,7 +45,10 @@ def run_arm(cases: list[BeaverCase], judges: dict[str, Callable], controller: Lo
     records = []
     with (out / "results.jsonl").open("w", encoding="utf-8") as f:
         for i, case in enumerate(cases, 1):
-            res = controller.run(case.agent_view(), verifier_for(case.case_id))
+            cb = (lambda step, payload, cid=case.case_id: on_event(cid, step, payload)) if on_event else None
+            if on_event:
+                on_event(case.case_id, "start", {"index": i, "total": len(cases), "question": case.question})
+            res = controller.run(case.agent_view(), verifier_for(case.case_id), on_event=cb)
             judge = judges[case.case_id]
             correct = [judge(rows)[0] if a["execution_status"] == "SUCCESS" else False
                        for a, rows in zip(res.attempts, res.rows)]
@@ -54,6 +60,9 @@ def run_arm(cases: list[BeaverCase], judges: dict[str, Callable], controller: Lo
                    "latency_ms": sum(int(a.get("llm_latency_ms") or 0) + int(a.get("exec_latency_ms") or 0)
                                      for a in res.attempts)}
             records.append(rec)
+            if on_event:
+                on_event(case.case_id, "judged", {"attempt_correct": correct, "final_correct": rec["final_correct"],
+                                                  "tokens": rec["tokens"], "latency_ms": rec["latency_ms"]})
             f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
             f.flush()
             a1 = res.attempts[0]

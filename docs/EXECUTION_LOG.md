@@ -193,6 +193,7 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 | D3 | 2026-09-25 | **方案 A：保持 `glm-4-flash`，冻结 baseline 配置**（prompt `baseline-v2`、k=20、3 个 few-shot 示例），在 89 道评测题上跑一次正式 baseline，然后进入 Phase 2–6 搭 Inner Loop；**整个流程跑通后再换模型**，用同一套流程重跑对比 | 先让端到端流程跑起来。失败的结构清楚（20/21 个列报错是列挂错了表），Loop 有足够的可修素材。已知限制：首次准确率接近 0 时，Harm Rate 基本无法测量，换模型后补测 |
 | D4 | 2026-09-25 | **维持 D3**：干预实验证明 glm-4-flash 在 5 类 Gold 提示全部给出时也修不好（0/30），但仍继续用它搭完 Phase 4–6，最后再换模型。Phase 3 标签：以确定性标注器（第一轮抽检一致率严格 75% / 宽松 90%）作为 Diagnosis Accuracy 的参照，因为干预实验在这个模型上给不出结论；换模型后重跑干预实验来校准 | 优先把 Loop 的工程结构和评测体系跑通。**已知后果**：这一轮 Loop 的恢复率可预判接近 0，实验数据只用来验证流程，不作为结论；换模型后用同一套流程重跑 |
 | D5 | 2026-09-25 | **不做 Phase 7（评测集对照实验）和 Phase 8（消融实验）**，当前重点改为优化现有代码 | 经与其他人讨论后决定。Loop 的工程结构已经跑通；Console 里 Phase 7 / 8 的预留区保留（代码已支持，以后需要时直接运行即可） |
+| D6 | 2026-09-28 | **默认模型保持 glm-4-flash**；DeepSeek 接入代码保留，`deepseek-flash`（关闭思考）作为备用，用户通知后再切换 | 探测显示 deepseek-flash 给全部 Gold 提示能修好 7/27（glm 0/30），适合展示 Loop 效果；但当前阶段重点是用免费模型修复代码、梳理流程，暂不产生费用。探测数据见本文件“换模型探测 · DeepSeek”一节 |
 
 ## 问题记录
 
@@ -294,4 +295,18 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 | 9.1 | 数据层 `app/data.py` | ✅ | 直接读取 Delta 表（evaluation.runs、traces.execution_traces、evaluation.evaluation_results、failure_labels、diagnoses、diagnosis_eval、benchmark.*），不读本地文件，新运行发布后自动出现。本地通过 profile 认证；在 Databricks Apps 中使用 App 自己的凭据加上 `DATABRICKS_WAREHOUSE_ID` |
 | 9.2 | 面板 `app/dashboard.py`（Streamlit） | ✅ 本地可用 | 5 个页签：**总览**（阶段状态、关键指标、全部运行）；**对照实验**（Phase 6 开发集 4 组的表格和图表 + **Phase 7 评测集预留区**）；**消融实验**（**Phase 8 预留表**，已列出 7 个计划消融组，结果发布后自动从"未运行"变为"已运行"）；**逐题追踪**（按运行和题目查看每次尝试的 SQL、执行结果、Verifier、诊断、修复技能、前后 SQL 对比，Gold 判分单独标注"Loop 不可见"）；**失败与诊断**（标注器主因与运行时诊断的分布、诊断准确率、按来源的准确率、混淆表）。启动：`streamlit run app/dashboard.py`，或用预览配置 `loop-console`（端口 8502） |
 | 9.3 | 验证 | ✅ | 本地预览 5 个页签都能渲染，没有报错。修复了两个问题：数据库空值读成 NaN 后被当作"真"（逐题追踪页报错），以及图表颜色映射和高度 |
-| 9.4 | 部署为 Databricks App | ⬜ | 待定：Free Edition 每个账号只能有 1 个 App，需要确认是否占用 gmv-rca-agent 的名额 |
+| 9.4 | 「运行 Loop」页面（点击执行、trace 实时刷新） | ✅ | `LoopController.run` / `run_arm` 新增可选 `on_event` 回调，逐步发出 retrieve / generate / execute / verify / diagnose / route / repair / final 事件（只通知、不改逻辑，回调出错也不影响 Loop；新增 2 个测试）。`app/runner.py` 在后台线程里走与 `scripts/phase6.py` 相同的代码路径；`app/app_pages/run_loop.py` 每秒刷新时间线，每题结束后才显示 Gold 判分（标注 Loop 不可见）。可选开发集题目（每次最多 5 题）、模型（glm-4-flash / deepseek-flash）、策略、Verifier；评测集默认锁定（D2，`SHT_ALLOW_EVAL=1` 解锁）。运行页发起的运行标记 `source=console`，只进入「逐题追踪」，不影响 Phase 6/7 对照表。本地实测 dw_5478：46 秒走完 2 次尝试，trace 逐步出现，发布到 Delta 成功 |
+| 9.5 | 部署为 Databricks App | ✅ | `python scripts/build_app_bundle.py` 生成 `app/bundle/`（schema、few-shot、开发集、LLM 缓存；含 BEAVER 内容，已 gitignore，只上传到自己的工作区）；`python scripts/deploy_app.py` 完成 secret scope（两个 key 只存 secret，不打印）、上传 59 个文件、创建 App（SQL warehouse + secret 资源）、给 App 服务主体授予项目 catalog 权限、部署。App `self-healing-text2sql` 部署成功：https://self-healing-text2sql-7474651013274104.aws.databricksapps.com（需 Databricks 登录）。Free Edition 在已有 gmv-rca-assistant（已停止）的情况下仍能创建第 2 个 App |
+
+## 换模型探测 · DeepSeek（开发集，2026-09-28）
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| M.1 | 客户端支持多厂商 | ✅ | `agent/llm.py` 改为一个 OpenAI 兼容客户端 + 厂商配置（`zhipu` / `deepseek`），脚本统一用 `make_client()`；`LLM_PROVIDER` / `LLM_MODEL` 可临时覆盖；复现旧运行时按记录的模型名推断厂商。智谱请求参数不变，旧缓存继续命中。新增 6 个测试，共 133 个通过。key 已配置（长度 35），只放在 `.env` |
+| M.2 | 模型确认 | ✅ | `deepseek-chat` 已是旧别名，平台实际返回 `deepseek-flash`（DeepSeek-V4.1-Flash）；账号可用模型只有 `deepseek-flash` 和 `deepseek-v4-pro`。该模型**默认开启思考模式**（推理 token 计入输出，且忽略 temperature）。采用：**固定模型 ID `deepseek-flash`，显式关闭思考（`thinking: disabled`），temperature=0**，与原 `deepseek-chat` 的非思考口径一致。temperature=0 不保证逐字一致，实验组共享第 1 次尝试仍靠磁盘缓存保证 |
+| M.3 | 开发集基线（30 题） | ✅ | run `baseline-20260928T061407-9cbe67`（`baseline-v2` / k=20，与 glm 同配置）：**首次准确率 3/30 = 10%**（glm 0/30）；**可执行 24/30**（glm 4/30）；报错 6（列找不到 3、窗口 frame 不支持 2、列类型不兼容 1）；能执行但答错 21（其中空结果 2）。表召回 0.92（不变）。约 45.3 万 token，模型响应中位 3.0 秒（glm 约 16.5 秒） |
+| M.4 | 全部 Gold 提示上界（27 道失败题，只跑 `all`） | ✅ | 结果 `runs/phase3/intervention-baseline-20260928T061407-9cbe67/`：**7/27 能修好**（glm 0/30）；补提示后仍报错 4 题。修好的 7 题在标注器里的主因都是"选表"。27 题主因分布：选表 22、查询拆解 4、未知 1。27 次调用、约 43 万 token |
+
+**结论**：deepseek-flash 满足换模型的判据——给对信息能改对（7/27），说明信息而非模型能力是主要瓶颈，Loop 有发挥空间。按 Oracle 信息估计，开发集准确率上限约从 3/30 提升到 10/30；Loop 只用无 Gold 信号，实际收益会低于这个上限。
+**新暴露的问题**：失败形态从"跑不起来"变为"能跑但答错"（21/27）。现有 SelfVerifier 只能触发约 8 题（报错 6 + 空结果 2），其余会被直接放行，这将成为 Loop 效果的主要限制。
+**决策 D6**：默认模型**保持 glm-4-flash**，继续用免费模型修复代码、梳理流程；需要时再由用户通知切换为 `deepseek-flash`（改 `config/phase1.yaml` 的 provider / model，或临时设 `LLM_PROVIDER=deepseek`）。

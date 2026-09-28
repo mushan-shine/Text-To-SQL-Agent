@@ -14,13 +14,18 @@ attempts but are counted as cost.
 
 Final answer: the last attempt that passed verification; otherwise the last
 attempt that executed; otherwise the last attempt.
+
+``run(..., on_event=cb)`` reports every step as ``cb(step, payload)`` (retrieve,
+generate, execute, verify, diagnose, route, repair, final) for live UIs. It only
+observes: payloads are copies of what goes into the trace anyway, and a failing
+callback never breaks the loop.
 """
 from __future__ import annotations
 
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from agent.generator import RULES, SYSTEM, extract_sql, render_schema
 from agent.retriever import BM25TableRetriever
@@ -31,6 +36,8 @@ from loop_engineer.policy import Policy
 from skills.base import REPAIR_TEMPLATE, RepairContext, observed_text
 
 log = logging.getLogger(__name__)
+
+EventCallback = Callable[[str, dict[str, Any]], None]
 
 GENERIC_INSTRUCTION = "The query above is wrong. Write a corrected query."
 
@@ -92,21 +99,35 @@ class LoopController:
                 "used_llm": True, "input_tokens": r.input_tokens, "output_tokens": r.output_tokens,
                 "llm_latency_ms": r.latency_ms, "tables": list(tables)}
 
-    def run(self, task: AgentTask, verifier: Any) -> LoopResult:
+    def run(self, task: AgentTask, verifier: Any, on_event: EventCallback | None = None) -> LoopResult:
+        def emit(step: str, **payload: Any) -> None:
+            if on_event is None:
+                return
+            try:
+                on_event(step, payload)
+            except Exception:  # an observer must never break the loop
+                log.exception("on_event(%s) failed", step)
+
         retrieval = self.retriever.retrieve(task.question, self.cfg.top_k)
+        emit("retrieve", tables=list(retrieval.tables), scores=list(retrieval.scores))
         gen = self.generator.generate(task, retrieval.tables)
         attempt = {"case_id": task.case_id, "attempt_id": 1, "question": task.question,
                    "retrieved_tables": list(retrieval.tables), "generated_sql": gen.sql,
                    "parse_status": gen.parse_status, "strategy": self.cfg.strategy,
                    "input_tokens": gen.llm.input_tokens, "output_tokens": gen.llm.output_tokens,
                    "llm_latency_ms": gen.llm.latency_ms, "used_llm": True, "diag_tokens": 0}
+        emit("generate", attempt_id=1, sql=gen.sql, parse_status=gen.parse_status,
+             tokens=gen.llm.input_tokens + gen.llm.output_tokens, latency_ms=gen.llm.latency_ms, cached=gen.llm.cached)
         attempts, all_rows = [], []
         for n in range(1, self.cfg.max_attempts + 1):
             exe, rows = self._execute(attempt["generated_sql"], task.db, attempt["parse_status"])
             attempt.update(exe)
+            emit("execute", attempt_id=n, **exe)
             decision = verifier.verify(attempt, rows)
             attempt.update({"verifier_mode": decision.mode, "verifier_decision": "PASS" if decision.passed else "FAIL",
                             "verifier_signals": list(decision.signals)})
+            emit("verify", attempt_id=n, mode=decision.mode, passed=decision.passed, signals=list(decision.signals),
+                 last=n == self.cfg.max_attempts)
             attempts.append(attempt)
             all_rows.append(rows)
             if decision.passed or n == self.cfg.max_attempts:
@@ -120,7 +141,11 @@ class LoopController:
             else:
                 obs = observe(attempt, task.db)   # whitelist: nothing gold-derived reaches diagnosis / repair
                 diag, usage = self.diagnoser.diagnose(obs)
+                emit("diagnose", attempt_id=n, failure_type=diag.failure_type, confidence=diag.confidence,
+                     reason=diag.reason, source=diag.source, repair_hints=diag.repair_hints,
+                     error_class=obs.error_class, unresolved_column=obs.unresolved_column)
                 route = self.policy.route(diag)
+                emit("route", attempt_id=n, skill=route.skill, fallback=route.fallback, reason=route.reason)
                 res = self.policy.skill(route.skill).repair(obs, diag, self.ctx)
                 attempt.update({"failure_type": diag.failure_type, "diagnosis_confidence": diag.confidence,
                                 "diagnosis_reason": diag.reason, "diagnosis_source": diag.source,
@@ -134,10 +159,18 @@ class LoopController:
                             "tables": list(res.tables)})
             attempt["repaired_sql"] = nxt["generated_sql"]
             attempt["repair_skill"] = nxt["repair_skill"]
+            emit("repair", attempt_id=n + 1, skill=nxt["repair_skill"], action=nxt.get("repair_action"),
+                 used_llm=nxt.get("used_llm"), before_sql=attempt["generated_sql"], sql=nxt["generated_sql"],
+                 parse_status=nxt["parse_status"],
+                 tokens=int(nxt.get("input_tokens") or 0) + int(nxt.get("output_tokens") or 0))
             attempt = nxt
         passed = [i for i, a in enumerate(attempts) if a["verifier_decision"] == "PASS"]
         executed = [i for i, a in enumerate(attempts) if a["execution_status"] == "SUCCESS"]
         final = passed[-1] if passed else executed[-1] if executed else len(attempts) - 1
         for i, a in enumerate(attempts):
             a["final_status"] = "FINAL" if i == final else "SUPERSEDED"
+        emit("final", final_attempt=final + 1, attempts=len(attempts),
+             verifier_decision=attempts[final]["verifier_decision"],
+             execution_status=attempts[final]["execution_status"], rows=attempts[final].get("result_row_count"),
+             preview=attempts[final].get("result_preview"))
         return LoopResult(attempts, all_rows, final)

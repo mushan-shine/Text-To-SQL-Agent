@@ -4,7 +4,7 @@
     {
       "name": "loop-console",
       "runtimeExecutable": "../.venv/Scripts/python.exe",
-      "runtimeArgs": ["-m", "streamlit", "run", "app/dashboard.py", "--server.port", "8502", "--server.headless", "true"],
+      "runtimeArgs": ["-m", "streamlit", "run", "app/streamlit_app.py", "--server.port", "8502", "--server.headless", "true"],
       "port": 8502
     }
   ]

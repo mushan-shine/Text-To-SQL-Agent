@@ -16,7 +16,7 @@ beaver:
   sample_seed: 77
 
 llm:
-  provider: zhipu
+  provider: zhipu   # deepseek / deepseek-flash
   model: glm-4-flash          # decision 1c (2026-09-25); overridable with ZHIPU_MODEL
   max_output_tokens: 2048
   max_calls: 400              # hard budget per run

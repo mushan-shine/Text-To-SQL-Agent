@@ -150,8 +150,41 @@ def log_mlflow(meta: dict, summary: dict, run_dir: Path, experiment_name: str, e
         return run.info.run_id
 
 
+def is_intervention_dir(run_dir: Path) -> bool:
+    return (run_dir / "results.json").exists() and not (run_dir / "run_meta.json").exists()
+
+
+def intervention_run_row(run_dir: Path, experiment_id: str, runs_root: Path = Path("runs/phase1")) -> dict:
+    """Summary row for a phase-3 intervention directory (evaluation.runs, mode=intervention).
+
+    Only the summary is published: the SQL in these runs was generated WITH gold hints, so none
+    of it may go to traces.* (the self-verified loop reads traces)."""
+    summary = json.loads((run_dir / "results.json").read_text(encoding="utf-8"))["summary"]
+    src = runs_root / summary["dev_run"] / "run_meta.json"
+    src_meta = json.loads(src.read_text(encoding="utf-8")) if src.exists() else {}
+    model = summary.get("model") or src_meta.get("model")
+    fixed, _, failures = str(summary["all_hints_fix_rate"]).partition("/")
+    meta = {"run_id": run_dir.name, "mode": "intervention", "split": "dev", "model": model,
+            "source_run": summary["dev_run"], "variants": summary.get("variants", "all")}
+    return {
+        "run_id": run_dir.name, "experiment_id": experiment_id, "split": "dev", "mode": "intervention",
+        "model": model, "prompt_version": src_meta.get("prompt_version"), "top_k": None,
+        "cases": int(failures), "correct": int(fixed), "first_pass_accuracy": None, "executable_rate": None,
+        "tokens_total": sum((summary.get("llm_usage") or {}).get(k, 0) for k in ("input_tokens", "output_tokens")),
+        "summary_json": json.dumps(summary, ensure_ascii=False), "meta_json": json.dumps(meta, ensure_ascii=False),
+        "mlflow_run_id": None, "created_at": dt.datetime.now(dt.timezone.utc),
+    }
+
+
 def publish_run(runner: Any, layout: Layout, run_dir: Path, experiment_id: str,
                 mlflow_experiment: str | None) -> dict[str, Any]:
+    if is_intervention_dir(run_dir):
+        row = intervention_run_row(run_dir, experiment_id)
+        if table_exists(runner, layout, layout.evaluation, "runs"):
+            runner.run(f"DELETE FROM {layout.fq(layout.evaluation, 'runs')} WHERE run_id = '{row['run_id']}'")
+        write_rows(runner, layout, layout.evaluation, "runs", [row], tables.RUNS)
+        return {"run_id": row["run_id"], "split": "dev", "mode": "intervention", "model": row["model"],
+                "all_hints_fixed": f"{row['correct']}/{row['cases']}"}
     meta, summary, records = load_run(run_dir)
     mlflow_run_id = log_mlflow(meta, summary, run_dir, mlflow_experiment, experiment_id) if mlflow_experiment else None
     rows = build_rows(meta, summary, records, experiment_id, mlflow_run_id)

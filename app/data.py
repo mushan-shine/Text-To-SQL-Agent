@@ -47,6 +47,7 @@ def runs(conn) -> pd.DataFrame:
     df["verifier"] = df["meta"].map(lambda m: m.get("verifier"))
     df["policy"] = df["meta"].map(lambda m: m.get("policy") or "targeted")
     df["disabled"] = df["meta"].map(lambda m: m.get("disabled") or "")
+    df["source"] = df["meta"].map(lambda m: m.get("source") or "cli")  # console = started from the Run page
     return df
 
 

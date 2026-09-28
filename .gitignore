@@ -6,3 +6,4 @@ data/beaver/
 *.parquet
 data/beaver_db/
 reports/
+app/bundle/

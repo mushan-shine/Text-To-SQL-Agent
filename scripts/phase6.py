@@ -26,7 +26,7 @@ for _stream in (sys.stdout, sys.stderr):
 import yaml  # noqa: E402
 
 from agent.generator import PROMPT_VERSION, FewShotGenerator, select_few_shot  # noqa: E402
-from agent.llm import CachingChatClient, UsageMeter, ZhipuChatClient  # noqa: E402
+from agent.llm import CachingChatClient, UsageMeter, make_client  # noqa: E402
 from agent.retriever import BM25TableRetriever, SchemaCatalog  # noqa: E402
 from benchmark.beaver.loader import load_cases, load_from_local_json  # noqa: E402
 from evaluation.baseline import gold_judge  # noqa: E402
@@ -84,9 +84,7 @@ def main() -> None:
         cases = cases[: args.limit]
 
     meter = UsageMeter(max_calls=int(lc["max_calls"]), max_tokens=int(lc["max_tokens"]))
-    inner = ZhipuChatClient.from_env(max_output_tokens=int(lc["max_output_tokens"]), meter=meter)
-    if not os.environ.get("ZHIPU_MODEL"):
-        inner.model = lc["model"]
+    inner = make_client(lc, max_output_tokens=int(lc["max_output_tokens"]), meter=meter)
     client = CachingChatClient(inner, Path(lc["cache"]))
     policy = Policy(mode=args.policy, disabled={s for s in args.disable.split(",") if s})
     controller = LoopController(BM25TableRetriever(catalog), FewShotGenerator(client, catalog, examples), dbx,
@@ -98,7 +96,7 @@ def main() -> None:
           (f"-no_{args.disable.replace(',', '_')}" if args.disable else "")
     meta = {"split": args.split, "strategy": args.strategy, "verifier": args.verifier,
             "upper_bound": args.verifier == "oracle", "policy": args.policy, "disabled": args.disable,
-            "self_signals": list(SELF_SIGNALS), "model": inner.model, "prompt_version": PROMPT_VERSION,
+            "self_signals": list(SELF_SIGNALS), "model": inner.model, "provider": inner.provider, "prompt_version": PROMPT_VERSION,
             "diagnoser": DIAGNOSER_VERSION, "max_attempts": 2, "case_ids": [c.case_id for c in cases]}
     run_id, summary = run_arm(cases, judges, controller, verifier_for, arm, Path("runs/phase6"), meta)
     summary["llm_usage"] = meter.snapshot()

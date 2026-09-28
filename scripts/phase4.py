@@ -69,11 +69,10 @@ def main() -> None:
 
     client = None
     if args.llm:
-        from agent.llm import CachingChatClient, UsageMeter, ZhipuChatClient
+        from agent.llm import CachingChatClient, UsageMeter, make_client
         load_env()
         lc = meta["config"]["llm"]
-        inner = ZhipuChatClient.from_env(max_output_tokens=512, meter=UsageMeter(max_calls=300))
-        inner.model = meta["model"]
+        inner = make_client(model=meta["model"], max_output_tokens=512, meter=UsageMeter(max_calls=300))
         client = CachingChatClient(inner, Path(lc["cache"]))
     diagnoser = Diagnoser(catalog, client)
 

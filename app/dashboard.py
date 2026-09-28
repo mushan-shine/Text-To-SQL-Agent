@@ -137,7 +137,8 @@ except Exception as e:  # connection / auth problems
     st.error(f"无法读取 Delta 表：{e}\n\n本地运行请先执行 `databricks auth login`；在 Databricks Apps 中请配置 SQL warehouse 资源。")
     st.stop()
 
-loops = R[R["mode"] == "loop"]
+all_loops = R[R["mode"] == "loop"]  # incl. small runs started from the Run page (case trace only)
+loops = all_loops[all_loops["source"] != "console"]
 main_loops = loops[(loops["policy"] == "targeted") & (loops["disabled"] == "")]
 eval_loops = main_loops[main_loops["split"] == "eval"]
 ablations = loops[(loops["split"] == "eval") & ((loops["policy"] != "targeted") | (loops["disabled"] != ""))]
@@ -150,8 +151,13 @@ phases = [("P0 数据准备", "done"), ("P1 Baseline", "done"), ("P2 Trace", "do
           ("P7 对照实验", "done" if len(eval_loops) else ""), ("P8 消融", "done" if len(ablations) else ""),
           ("P9 Console", "part")]
 st.markdown("".join(f'<span class="phase {c}">{html.escape(n)}</span>' for n, c in phases), unsafe_allow_html=True)
-model = R["model"].dropna().iloc[-1] if R["model"].notna().any() else "—"
-st.caption(f"模型 `{model}` · 数据来自 Unity Catalog `{data.CATALOG}` · 缓存 5 分钟，右上角菜单 Rerun 可刷新")
+# the model of the loop experiments, not of the latest run (model probes also publish runs)
+loop_models = main_loops.sort_values("created_at")["model"].dropna()
+model = loop_models.iloc[-1] if len(loop_models) else (R["model"].dropna().iloc[-1] if R["model"].notna().any() else "—")
+probed = sorted(set(R["model"].dropna()) - {model})
+st.caption(f"Loop 实验模型 `{model}`" + (f" · 另有探测模型 {', '.join(f'`{m}`' for m in probed)}（见总览·模型对比）"
+                                         if probed else "")
+           + f" · 数据来自 Unity Catalog `{data.CATALOG}` · 缓存 5 分钟，右上角菜单 Rerun 可刷新")
 
 tab_over, tab_exp, tab_abl, tab_trace, tab_diag = st.tabs(
     ["总览", "对照实验（P6 / P7）", "消融实验（P8）", "逐题追踪", "失败与诊断"])
@@ -181,12 +187,39 @@ with tab_over:
     st.markdown(
         "- **流程已跑通**：生成 → 验证 → 诊断 → 修复 → 再验证，四个实验组和上界分析都能自动运行和发布。\n"
         "- **瓶颈在模型能力**：干预实验中，5 类 Gold 提示全部给出后，开发集仍是 0/30；各组恢复都是 0（决策 D4）。\n"
-        "- **工程层面的差异**：相近的 token 成本下，Targeted Loop 让更多 SQL 变得可执行（开发集 9 vs 6）。")
+        "- **工程层面的差异**：相近的 token 成本下，Targeted Loop 让更多 SQL 变得可执行（开发集 9 vs 6）。\n"
+        "- **换模型探测**：deepseek-flash 给全部 Gold 提示能修好 7/27（glm-4-flash 为 0/30），说明换用更强模型后 Loop 有发挥空间；"
+        "失败形态随之变为“能执行但答错”，Verifier 成为主要短板。目前仍用 glm-4-flash 梳理流程（决策 D6）。")
+
+    st.subheader("模型对比（开发集探测）")
+    st.caption("同一套配置（prompt baseline-v2、BM25 k=20、3 个 few-shot）只换模型。"
+               "“全部 Gold 提示后修好”是离线上界分析：生成时给了 Gold 提示，Loop 运行时看不到这些信息。")
+    devb = R[(R["mode"] == "dev")].sort_values("created_at")
+    interv = R[(R["mode"] == "intervention")].sort_values("created_at")
+    mrows = []
+    for m in sorted(set(devb["model"].dropna()) | set(interv["model"].dropna())):
+        b = devb[devb["model"] == m].tail(1)
+        iv = interv[interv["model"] == m].tail(1)
+        bs = b.iloc[0]["summary"] if len(b) else {}
+        ex = (bs.get("execution_status") or {}).get("SUCCESS")
+        mrows.append({
+            "模型": m, "Loop 实验使用": "是" if m == model else "探测",
+            "首次答对": f"{int(b.iloc[0]['correct'])} / {int(b.iloc[0]['cases'])}" if len(b) else "—",
+            "可执行": f"{ex} / {bs.get('cases')}" if ex is not None else "—",
+            "全部 Gold 提示后修好": f"{int(iv.iloc[0]['correct'])} / {int(iv.iloc[0]['cases'])}" if len(iv) else "—",
+            "平均 token/题": f"{bs['tokens_mean']:,}" if bs.get("tokens_mean") else "—",
+            "LLM 响应中位耗时": f"{bs['llm_latency_ms_median'] / 1000:.1f} 秒" if bs.get("llm_latency_ms_median") else "—",
+            "基线 run_id": b.iloc[0]["run_id"] if len(b) else "—",
+        })
+    if mrows:
+        st.dataframe(pd.DataFrame(mrows), hide_index=True, width="stretch")
+    else:
+        st.info("还没有开发集基线运行。")
 
     st.subheader("所有运行")
     view = R[["created_at", "run_id", "mode", "split", "arm", "model", "prompt_version", "cases", "correct",
               "first_pass_accuracy", "tokens_total", "mlflow_run_id"]].sort_values("created_at", ascending=False)
-    st.dataframe(view, hide_index=True, use_container_width=True)
+    st.dataframe(view, hide_index=True, width="stretch")
 
 # ------------------------------------------------------------------ experiments
 
@@ -196,7 +229,7 @@ with tab_exp:
     dev = latest(main_loops[main_loops["split"] == "dev"])
     if len(dev):
         dev = dev.set_index("arm").reindex([a for a in PLANNED_P7 if a in set(dev["arm"])]).reset_index()
-        st.dataframe(loop_table(dev), hide_index=True, use_container_width=True)
+        st.dataframe(loop_table(dev), hide_index=True, width="stretch")
         long = pd.DataFrame([{"实验组": ARM_CN.get(r.arm, r.arm), "阶段": k, "题数": r.summary[f"executable_{v}"]}
                              for r in dev.itertuples() for k, v in (("第 1 次", "first"), ("最终", "final"))])
         chart = alt.Chart(long).mark_bar().encode(
@@ -205,7 +238,7 @@ with tab_exp:
             yOffset=alt.YOffset("阶段:N", sort=["第 1 次", "最终"]),
             color=alt.Color("阶段:N", scale=alt.Scale(domain=["第 1 次", "最终"], range=[MUTED, ACCENT]), title=None),
             tooltip=["实验组", "阶段", "题数"]).properties(height=90 * len(dev))
-        st.altair_chart(chart, use_container_width=True)
+        st.altair_chart(chart, width="stretch")
     else:
         st.info("还没有开发集上的 Loop 运行。")
 
@@ -213,7 +246,7 @@ with tab_exp:
     ev = latest(eval_loops)
     if len(ev):
         ev = ev.set_index("arm").reindex([a for a in PLANNED_P7 if a in set(ev["arm"])]).reset_index()
-        st.dataframe(loop_table(ev), hide_index=True, use_container_width=True)
+        st.dataframe(loop_table(ev), hide_index=True, width="stretch")
         missing = [ARM_CN[a] for a in PLANNED_P7 if a not in set(ev["arm"])]
         if missing:
             st.caption("尚未运行：" + "、".join(missing))
@@ -245,7 +278,7 @@ with tab_abl:
         else:
             rows.append({"消融组": label, "状态": "未运行", "最终准确率": "—", "恢复": "—", "误伤": "—",
                          "净收益": "—", "可执行 首→终": "—", "额外 token": "—"})
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     if not len(ablations):
         st.markdown(
             '<div class="reserved"><b>预留：Phase 8 尚未运行。</b><br>'
@@ -256,11 +289,13 @@ with tab_abl:
 # ------------------------------------------------------------------ case trace
 
 with tab_trace:
-    if not len(loops):
+    if not len(all_loops):
         st.info("还没有 Loop 运行。")
     else:
-        opts = loops.sort_values("created_at", ascending=False)
-        labels = {r.run_id: f"{ARM_CN.get(r.arm, r.arm)} · {r.split} · {r.run_id[-22:]}" for r in opts.itertuples()}
+        opts = all_loops.sort_values("created_at", ascending=False)
+        labels = {r.run_id: (f"[运行页] {ARM_CN.get(r.arm.removeprefix('console-'), r.arm)} · {r.model} · {r.split}"
+                             f" · {r.run_id[-22:]}" if r.source == "console" else
+                             f"{ARM_CN.get(r.arm, r.arm)} · {r.split} · {r.run_id[-22:]}") for r in opts.itertuples()}
         default = next((r.run_id for r in opts.itertuples() if r.arm == "targeted-self"), opts.iloc[0]["run_id"])
         run_id = st.selectbox("运行", list(labels), index=list(labels).index(default), format_func=labels.get)
         T, E = q_traces(run_id), q_evals(run_id)
@@ -351,7 +386,7 @@ with tab_diag:
         st.altair_chart(alt.Chart(dist).mark_bar().encode(
             x=alt.X("n:Q", title="题数"), y=alt.Y("类型:N", title=None), yOffset="来源:N",
             color=alt.Color("来源:N", scale=alt.Scale(domain=["标注器主因", "运行时诊断"], range=[ACCENT, WARN]), title=None),
-            tooltip=["类型", "来源", "n"]).properties(height=280), use_container_width=True)
+            tooltip=["类型", "来源", "n"]).properties(height=280), width="stretch")
         if len(d):
             st.markdown("**诊断来源的准确率**")
             by = d.groupby("diagnosis_source").agg(题数=("case_id", "count"), 严格=("diagnosis_correct", "mean"),
@@ -360,5 +395,5 @@ with tab_diag:
             st.dataframe(by.rename(columns={"diagnosis_source": "来源"}), hide_index=True)
             st.markdown("**标注器主因 → 运行时诊断**")
             cm = pd.crosstab(d["actual_failure_type"].map(TYPE_CN), d["predicted_failure_type"].map(TYPE_CN))
-            st.dataframe(cm, use_container_width=True)
+            st.dataframe(cm, width="stretch")
         st.caption("标注器使用 Gold 标注，只用于评测；主因按上下游顺序取第一项，是约定而非因果证明。")

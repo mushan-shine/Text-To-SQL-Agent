@@ -121,12 +121,12 @@ def publish(labels: list[dict]) -> None:
     dbx.close()
 
 
-def intervene(run_dir: Path, workers: int) -> dict:
+def intervene(run_dir: Path, workers: int, only: set[str] | None = None) -> dict:
     """Interventional attribution on a DEV run (offline analysis; gold hints never reach the agent)."""
     import logging
 
     from agent.generator import FewShotGenerator, select_few_shot
-    from agent.llm import CachingChatClient, UsageMeter, ZhipuChatClient
+    from agent.llm import CachingChatClient, UsageMeter, make_client
     from benchmark.beaver.dataset import BeaverCase
     from benchmark.beaver.loader import load_from_local_json
     from evaluation.devset import dev_judges
@@ -159,22 +159,21 @@ def intervene(run_dir: Path, workers: int) -> dict:
                                int(fs["max_tables"]), int(fs["max_sql_chars"]))
     assert [e.question for e in examples] == [e["question"] for e in meta["few_shot"]], "few-shot drifted"
     catalog = SchemaCatalog.from_json(Path(f"runs/phase1/schema_{b['db']}.json").read_text(encoding="utf-8"))
-    client = ZhipuChatClient.from_env(max_output_tokens=int(lc["max_output_tokens"]),
-                                      meter=UsageMeter(max_calls=400, max_tokens=5_000_000))
-    client.model = meta["model"]
+    client = make_client(model=meta["model"], max_output_tokens=int(lc["max_output_tokens"]),
+                         meter=UsageMeter(max_calls=400, max_tokens=5_000_000))
     generator = FewShotGenerator(CachingChatClient(client, Path(lc["cache"])), catalog, examples)
     d = cfg["databricks"]
     dbx = DatabricksSqlExecutor(catalog=d["catalog"], profile=d.get("profile"), ansi_mode=bool(d["ansi_mode"]),
                                 statement_timeout_s=int(d["statement_timeout_s"]))
     judges = dev_judges(load_devset(Path(cfg["dev"]["path"])), b["split"])
-    results = run_intervention(cases, retrieved, generator, dbx, judges, schema, set(catalog.tables), workers)
+    results = run_intervention(cases, retrieved, generator, dbx, judges, schema, set(catalog.tables), workers, only=only)
     dbx.close()
 
     # compare with the deterministic labels of the same run
     det = {x["case_id"]: x for x in label_run(run_dir)[1]}
     unique = [r for r in results if r["causal_type"] in VARIANT_TYPE.values()]
     summary = {
-        "dev_run": meta["run_id"], "failures": len(results),
+        "dev_run": meta["run_id"], "model": meta["model"], "variants": sorted(only) if only else "all", "failures": len(results),
         "causal_distribution": dict(Counter(r["causal_type"] for r in results)),
         "single_hint_fix_rate": {v: f"{sum(r['single_hint_correct'].get(v, False) for r in results)}/"
                                     f"{sum(v in r['single_hint_correct'] for r in results)}" for v in VARIANT_TYPE},
@@ -202,6 +201,7 @@ def main() -> None:
     ap.add_argument("--publish", action="store_true")
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--seed", type=int, default=20260925)
+    ap.add_argument("--variants", default="", help="intervene: comma-separated subset, e.g. 'all' (model probe)")
     args = ap.parse_args()
     run_dir = Path(args.run_dir)
     if args.mode == "label":
@@ -210,7 +210,7 @@ def main() -> None:
             publish(labels)
         print(json.dumps(summary, indent=2, ensure_ascii=False))
     elif args.mode == "intervene":
-        print(json.dumps(intervene(run_dir, args.workers), indent=2, ensure_ascii=False))
+        print(json.dumps(intervene(run_dir, args.workers, {v for v in args.variants.split(",") if v} or None), indent=2, ensure_ascii=False))
     else:
         print(spotcheck(run_dir, args.n, args.seed))
 
