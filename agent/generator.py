@@ -20,6 +20,7 @@ from __future__ import annotations
 import random
 import re
 from dataclasses import dataclass
+from typing import Any
 
 import sqlglot
 
@@ -61,6 +62,9 @@ class Generation:
     parse_status: str            # OK | NO_SQL | EMPTY_RESPONSE
     llm: LlmResponse
     prompt: str
+    example_ids: tuple[str, ...] = ()    # few-shot examples used (dynamic mode: per question)
+    schema_tables: tuple[str, ...] = ()  # tables whose schema was shown
+    notes: str = ""                      # warehouse usage notes shown (knowledge mode)
 
 
 def select_few_shot(queries: list[dict], exclude_ids: set, n: int = 3, seed: int = 20260925,
@@ -96,8 +100,10 @@ def render_schema(catalog: SchemaCatalog, tables: tuple[str, ...]) -> str:
 
 
 def build_prompt(task: AgentTask, schema_text: str, examples: list[FewShotExample],
-                 oracle_hints: list[str] | None = None) -> str:
+                 oracle_hints: list[str] | None = None, notes: str = "") -> str:
     parts = [RULES, "", "Schema:", schema_text, ""]
+    if notes:  # warehouse usage notes mined from solved queries (agent/knowledge.py)
+        parts += [notes, ""]
     if examples:
         parts.append("Examples (from the same warehouse):")
         for ex in examples:
@@ -121,16 +127,39 @@ def extract_sql(text: str) -> tuple[str, str]:
     return body.rstrip().rstrip(";").strip(), "OK"
 
 
+PROMPT_VERSION_DYNAMIC = "baseline-v3-dynfs"
+
+
 @dataclass
 class FewShotGenerator:
+    """``index`` (agent/examples.py ExampleIndex) switches to dynamic few-shot: the ``k`` solved questions most
+    similar to the new one replace the fixed examples, and the tables they use are added to the schema shown
+    (up to ``max_extra_tables``), so the model sees which tables this warehouse uses for such questions."""
+
     client: ChatClient
     catalog: SchemaCatalog
     examples: list[FewShotExample]
+    index: Any = None
+    k: int = 4
+    max_extra_tables: int = 6
+    knowledge: Any = None        # agent/knowledge.py WarehouseKnowledge: usage notes per question
+
+    @property
+    def prompt_version(self) -> str:
+        base = PROMPT_VERSION_DYNAMIC if self.index is not None else PROMPT_VERSION
+        return base + ("+kb" if self.knowledge is not None else "")
 
     def generate(self, task: AgentTask, tables: tuple[str, ...], oracle_hints: list[str] | None = None) -> Generation:
         """``oracle_hints`` carry GOLD annotations (BEAVER setting=1/2). Offline diagnostic analysis
         only (evaluation/intervention.py) — the agent, loop and experiments never pass them."""
-        prompt = build_prompt(task, render_schema(self.catalog, tables), self.examples, oracle_hints)
+        examples = self.examples
+        if self.index is not None:
+            hits = self.index.top(task.question, self.k)
+            examples = [h.example for h in hits]
+            extra = [t for h in hits for t in h.tables if t in self.catalog.tables and t not in tables]
+            tables = tuple(tables) + tuple(dict.fromkeys(extra))[: self.max_extra_tables]
+        notes = self.knowledge.notes_for(task.question, tables) if self.knowledge is not None else ""
+        prompt = build_prompt(task, render_schema(self.catalog, tables), examples, oracle_hints, notes)
         r = self.client.complete(prompt, system=SYSTEM)
         sql, status = extract_sql(r.text)
-        return Generation(sql, r.text, status, r, prompt)
+        return Generation(sql, r.text, status, r, prompt, tuple(e.source_id for e in examples), tuple(tables), notes)

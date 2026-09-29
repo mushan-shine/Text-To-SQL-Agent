@@ -23,4 +23,4 @@ class FindJoinPath:
                        "condition, join on matching keys only, and aggregate before joining when a join would "
                        "duplicate rows.")
         return llm_repair(self.name, obs, diagnosis, ctx, [*used, *obs.retrieved_tables], instruction,
-                          f"join candidates offered: {len(joins)}")
+                          f"join candidates offered: {len(joins)}", {"tables_in_sql": used, "join_candidates": joins})

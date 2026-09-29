@@ -35,7 +35,7 @@ from evaluation.loop_run import run_arm  # noqa: E402
 from loop_engineer.controller import LoopConfig, LoopController  # noqa: E402
 from loop_engineer.diagnose import DIAGNOSER_VERSION, Diagnoser  # noqa: E402
 from loop_engineer.policy import Policy  # noqa: E402
-from loop_engineer.verifier import SELF_SIGNALS, OracleVerifier, SelfVerifier  # noqa: E402
+from loop_engineer.verifier import SELF_SIGNALS, VERIFIER_VERSION, OracleVerifier, SelfVerifier  # noqa: E402
 from skills.base import RepairContext  # noqa: E402
 
 
@@ -47,6 +47,9 @@ def main() -> None:
     ap.add_argument("--disable", default="", help="comma-separated skills to disable (ablation)")
     ap.add_argument("--split", choices=["dev", "eval"], default="dev")
     ap.add_argument("--eval", action="store_true", help="confirm a run on the evaluation set (phase 7)")
+    ap.add_argument("--max-repairs", type=int, default=1, help="repair rounds per question (attempts = +1)")
+    ap.add_argument("--few-shot", choices=["static", "dynamic"], help="override few_shot.mode of the config")
+    ap.add_argument("--knowledge", choices=["off", "on"], help="override knowledge.mode (outer-loop usage notes)")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--config", default="config/phase1.yaml")
     args = ap.parse_args()
@@ -63,6 +66,10 @@ def main() -> None:
 
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     b, lc, fs, d = cfg["beaver"], cfg["llm"], cfg["few_shot"], cfg["databricks"]
+    if args.few_shot:
+        fs["mode"] = args.few_shot
+    if args.knowledge:
+        cfg.setdefault("knowledge", {})["mode"] = args.knowledge
     queries, _ = load_from_local_json(b["local_dir"], b["split"])
     eval_cases = load_cases("local_json", b["split"], int(b["sample_size"]), int(b["sample_seed"]), b["local_dir"])[0]
     eval_ids = {c.case_id.split(":", 1)[1] for c in eval_cases}
@@ -87,17 +94,26 @@ def main() -> None:
     inner = make_client(lc, max_output_tokens=int(lc["max_output_tokens"]), meter=meter)
     client = CachingChatClient(inner, Path(lc["cache"]))
     policy = Policy(mode=args.policy, disabled={s for s in args.disable.split(",") if s})
-    controller = LoopController(BM25TableRetriever(catalog), FewShotGenerator(client, catalog, examples), dbx,
+    from agent.examples import build_generator_index
+    from agent.knowledge import knowledge_for
+    dev_ids = {str(c["id"]) for c in load_devset(Path(cfg["dev"]["path"]))["cases"]}
+    generator = FewShotGenerator(client, catalog, examples, index=build_generator_index(queries, eval_ids, dev_ids, fs),
+                                 k=int(fs.get("dynamic_k", 4)), max_extra_tables=int(fs.get("dynamic_max_extra_tables", 6)),
+                                 knowledge=knowledge_for(cfg, ROOT))
+    controller = LoopController(BM25TableRetriever(catalog), generator, dbx,
                                 Diagnoser(catalog, client), policy, RepairContext(catalog, client, examples),
-                                LoopConfig(strategy=args.strategy, top_k=int(cfg["retrieval"]["top_k"]),
+                                LoopConfig(strategy=args.strategy, max_attempts=args.max_repairs + 1,
+                                           top_k=int(cfg["retrieval"]["top_k"]),
                                            max_result_rows=int(d["max_result_rows"])))
     verifier_for = (lambda cid: SelfVerifier()) if args.verifier == "self" else (lambda cid: OracleVerifier(judges[cid]))
     arm = f"{args.strategy}-{args.verifier}" + (f"-policy_{args.policy}" if args.policy != "targeted" else "") + \
           (f"-no_{args.disable.replace(',', '_')}" if args.disable else "")
     meta = {"split": args.split, "strategy": args.strategy, "verifier": args.verifier,
             "upper_bound": args.verifier == "oracle", "policy": args.policy, "disabled": args.disable,
-            "self_signals": list(SELF_SIGNALS), "model": inner.model, "provider": inner.provider, "prompt_version": PROMPT_VERSION,
-            "diagnoser": DIAGNOSER_VERSION, "max_attempts": 2, "case_ids": [c.case_id for c in cases]}
+            "self_signals": list(SELF_SIGNALS), "verifier_version": VERIFIER_VERSION, "model": inner.model, "provider": inner.provider, "prompt_version": generator.prompt_version, "few_shot": fs.get("mode", "static"),
+            "knowledge": (cfg.get("knowledge") or {}).get("mode", "off"),
+            "diagnoser": DIAGNOSER_VERSION, "max_attempts": args.max_repairs + 1,
+            "case_ids": [c.case_id for c in cases]}
     run_id, summary = run_arm(cases, judges, controller, verifier_for, arm, Path("runs/phase6"), meta)
     summary["llm_usage"] = meter.snapshot()
     (Path("runs/phase6") / run_id / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False),

@@ -41,6 +41,17 @@ def main() -> None:
                                int(fs["max_sql_chars"]))
     (out / "few_shot.json").write_text(json.dumps([asdict(e) for e in examples], ensure_ascii=False, indent=1),
                                        encoding="utf-8")
+    # dynamic few-shot pool: solved questions minus the evaluation sample and the dev set (agent/examples.py)
+    from agent.examples import ExampleIndex
+    dev_ids = {str(c["id"]) for c in json.loads((ROOT / cfg["dev"]["path"]).read_text(encoding="utf-8"))["cases"]}
+    pool = ExampleIndex.build(queries, eval_ids | dev_ids, int(fs.get("dynamic_max_sql_chars", 2500)))
+    import gzip  # ~10 MB as JSON -> gzip keeps it well under the workspace upload limit
+    (out / "examples_pool.json").unlink(missing_ok=True)
+    with gzip.open(out / "examples_pool.json.gz", "wt", encoding="utf-8") as f:
+        json.dump(pool.to_rows(), f, ensure_ascii=False)
+    kb = ROOT / cfg.get("knowledge", {}).get("path", "runs/knowledge/kb.json")   # outer-loop usage notes
+    if kb.exists():
+        shutil.copy(kb, out / "kb.json")
     shutil.copy(ROOT / f"runs/phase1/schema_{b['db']}.json", out / f"schema_{b['db']}.json")
     shutil.copy(ROOT / cfg["dev"]["path"], out / "devset.json")
     cache = ROOT / cfg["llm"]["cache"]

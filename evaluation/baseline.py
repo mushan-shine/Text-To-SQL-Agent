@@ -115,7 +115,7 @@ def run_baseline(cases: list[BeaverCase], judges: dict[str, Judge], retriever: B
     run_id = f"baseline-{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:6]}"
     out = out_root / run_id
     out.mkdir(parents=True, exist_ok=True)
-    meta = {**run_meta, "run_id": run_id, "prompt_version": PROMPT_VERSION, "top_k": cfg.top_k,
+    meta = {**run_meta, "run_id": run_id, "prompt_version": getattr(generator, "prompt_version", PROMPT_VERSION), "top_k": cfg.top_k,
             "few_shot": [{"id": e.source_id, "question": e.question, "sql": e.sql} for e in generator.examples]}
     (out / "run_meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
     records = []

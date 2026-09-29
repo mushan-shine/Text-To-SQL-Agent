@@ -1,354 +1,315 @@
-# 项目架构：自顶向下拆解
+# 项目架构：整体框架与各模块的设计原理
 
-> 本文按"整体 → 分层 → 模块"的顺序，讲清项目由哪几部分组成、每部分怎么实现、有什么价值、面试时讲什么。
-> Loop 的逐步执行过程见 [LOOP_WALKTHROUGH.md](LOOP_WALKTHROUGH.md)；设计取舍见 [LOOP_DESIGN.md](LOOP_DESIGN.md)。
-> 文中所有数字都来自 [EXECUTION_LOG.md](EXECUTION_LOG.md) 和 `runs/` 下的真实运行结果。
+> 本文回答两个问题：**项目由哪几部分组成**，以及**每部分为什么这样设计、内部逻辑是什么**。
+> 运行一次项目要经过哪些步骤、各步执行哪段代码，见 [RUN_FLOW.md](RUN_FLOW.md)；Loop 内部逐步讲解见 [LOOP_WALKTHROUGH.md](LOOP_WALKTHROUGH.md)；所有数字的出处见 [EXECUTION_LOG.md](EXECUTION_LOG.md)。
+> 内容以 2026-09-29 的代码为准。
 
 ---
 
 ## 1. 一句话定位
 
-**一个能"自己发现错误、判断错在哪、选对工具修复、并用数据证明修复是否有效"的 Text-to-SQL Agent。**
-Text-to-SQL 只是载体，核心是 **Loop Engineering**：把"生成 → 执行 → 校验 → 诊断 → 修复"做成一个可观测、可评测、可消融的工程闭环。
+**一个带"双循环"的 Text-to-SQL Agent**：
+- **内循环**在运行时自己发现失败、诊断原因、选技能修复；
+- **外循环**离线从已解题和错误中归纳数仓知识，交给生成端使用。
 
-- 基准：BEAVER（企业数据仓库题，dw 库 97 张表、5,787 题；官方样本 100 题 → 可用 89 题）
-- 平台：Databricks（Unity Catalog + SQL Warehouse + Delta + MLflow）
-- 模型：智谱 `glm-4-flash`（免费、贪心解码，决策 D3/D4：先跑通全流程再换模型）
+每一步都有离线评估数据支撑。Text-to-SQL 是载体，项目要展示的是 **Loop Engineering**：怎么设计闭环、怎么度量闭环、怎么用数据决定闭环里放什么。
+
+| 项 | 选择 |
+|---|---|
+| 基准 | BEAVER dw 库（97 张表、5,787 道题）；评测集 89 题、开发集 30 题 |
+| 平台 | Databricks：Unity Catalog、SQL Warehouse、Delta、MLflow、Databricks Apps |
+| 模型 | 默认智谱 glm-4-flash（免费）；DeepSeek deepseek-flash 可切换（决策 D6） |
 
 ---
 
-## 2. 总体架构图
+## 2. 总体框架
 
 ```mermaid
 flowchart TB
-    subgraph L6["⑦ 外层 Loop / 治理"]
-        OUT["开发集调参 → 冻结配置 → 评测集只跑一次<br/>决策记录 D1–D5 · 问题记录 #1–#8"]
+    subgraph OUT["⑤ 外循环（离线，可以使用 Gold）"]
+        AN["错误分析<br/>analyze_run / 失败标注"] --> KN["知识归纳<br/>相似题示例库 · 数仓使用说明"]
+        EV2["候选方法的离线评估<br/>verifier_eval · judge_eval · validator_eval"]
     end
 
-    subgraph L5["⑥ 可观测与展示"]
-        TR["traces.* (Agent 可见)"]
-        EV["evaluation.* (含 Gold 判定)"]
-        ML["MLflow 实验"]
-        UI["Loop Debug Console (Streamlit)"]
+    subgraph GEN["③ 生成端 Agent"]
+        RT["BM25 表检索"] --> GE["SQL 生成<br/>规则 + schema + 示例 + 使用说明"]
+        LLM["LLM 客户端<br/>多厂商 · 缓存 · 预算"]
     end
 
-    subgraph L4["⑤ 评测与分析"]
-        EX["EX 判定 (冻结 Gold)"]
-        LB["确定性失败标注器"]
-        IV["干预实验"]
-        DA["诊断准确率"]
-        LM["Loop 指标: Recovery / Harm / Net Gain / 成本"]
+    subgraph IN["④ 内循环 Loop（运行时，不接触 Gold）"]
+        EX["执行"] --> VF["自检 v2"] --> OB["观察"] --> DG["诊断"] --> PL["路由"] --> SK["修复技能 ×5"]
+        SK --> EX
     end
 
-    subgraph L3["④ Loop 核心 (Inner Loop)"]
-        VF["Verifier"] --> OB["Observer"] --> DG["Diagnoser"] --> PL["Policy"] --> SK["Repair Skills ×5"]
-        CT["LoopController"]
+    subgraph PLAT["② 平台层 Databricks"]
+        SQL["SQL 执行器"]
+        UC["Unity Catalog：benchmark · dw · traces · evaluation · experience"]
     end
 
-    subgraph L2["③ Agent 基线"]
-        RT["BM25 表检索"] --> GN["Few-shot SQL 生成"] --> LLM["LLM Client<br/>缓存 · 预算 · 重试"]
+    subgraph BASE["① 基准与数据底座"]
+        BV["BEAVER + MySQL 参照库"] --> RP["复制到 Delta"] --> AD["方言适配 + 跨引擎比较"] --> GD["冻结 Gold 结果"]
     end
 
-    subgraph L1["② 平台层 Databricks"]
-        EXE["SQL 执行器"]
-        UC["Unity Catalog: benchmark / dw / traces / evaluation"]
+    subgraph EVAL["⑥ 评测"]
+        JU["事后判分（冻结 Gold）"] --> MET["指标：准确率 · 恢复 / 误伤 · 成本"]
     end
 
-    subgraph L0["① 基准与数据底座 (Phase 0)"]
-        BV["BEAVER 数据 + MySQL 参照库"] --> RP["97 表复制到 Delta"] --> AD["方言适配 + 跨引擎比较"] --> GD["冻结 Gold 结果 (89 题)"]
+    subgraph OBS["⑦ 可观测与平台"]
+        TR["traces / evaluation 表 · MLflow"] --> UI["Loop Debug Console · 运行 Loop 页 · 分析报告"]
     end
 
-    L0 --> L1 --> L2 --> L3
-    L3 -- "每次尝试" --> TR
-    L3 -. "跑完才判分" .-> L4
-    GD --> EX
-    L4 --> EV --> UI
-    TR --> UI
-    L4 --> ML
-    L4 --> L6
-    L6 -. "调参 / 换模型 / 改技能" .-> L2
-    L6 -.-> L3
+    BASE --> PLAT
+    KN -- "知识（不含当前题的 Gold）" --> GE
+    GE --> EX
+    PLAT --- EX
+    IN -- "Loop 结束后" --> JU
+    GD --> JU
+    IN -- "每一步的事件" --> TR
+    MET --> TR
+    TR --> AN
+    MET --> AN
 ```
 
 纯文本版（适合白板手画）：
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ ⑦ 外层 Loop / 治理   开发集调参 → 冻结 → 评测集跑一次 → 决策记录 │
-├──────────────────────────────────────────────────────────────┤
-│ ⑥ 可观测与展示       traces.* │ evaluation.* │ MLflow │ Console   │
-├──────────────────────────────────────────────────────────────┤
-│ ⑤ 评测与分析         EX │ 失败标注 │ 干预实验 │ 诊断准确率 │ Loop 指标 │
-├──────────────────────────────────────────────────────────────┤
-│ ④ Loop 核心          Verify → Observe → Diagnose → Policy → Skill │
-│                      （LoopController 驱动，最多 2 次尝试）          │
-├──────────────────────────────────────────────────────────────┤
-│ ③ Agent 基线         BM25 检索 → Few-shot 生成 → LLM Client       │
-├──────────────────────────────────────────────────────────────┤
-│ ② 平台层             Databricks SQL Warehouse │ Unity Catalog │ Delta │
-├──────────────────────────────────────────────────────────────┤
-│ ① 基准与数据底座     BEAVER → MySQL 参照 → 复制 → 适配 → 冻结 Gold  │
-└──────────────────────────────────────────────────────────────┘
-  横切关注点：Gold 隔离 · 可复现 · 成本控制 · 安全（密钥不入库）
+                 ┌──────────── ⑤ 外循环（离线，可用 Gold）────────────┐
+                 │ 错误分析 → 归纳知识（相似题示例、数仓使用说明）       │
+                 │ 候选自检方法的离线评估（抓错率 / 误报率）              │
+                 └──────────────┬───────────────────────▲─────────────┘
+                     知识（运行时只读）│                    │ trace + 判分
+┌──── ③ 生成端 ────────────────────▼──┐   ┌───────────────┴─────────────┐
+│ 检索表 → 生成 SQL（规则+schema+示例+说明）│──▶│ ④ 内循环：执行→自检→观察→诊断  │
+└─────────────────────────────────────┘   │           →路由→修复→再执行    │
+                                          └───────┬───────────────────────┘
+                                                  │ Loop 结束后
+                                   ⑥ 评测：冻结 Gold 判分 → 指标
+                                   ⑦ 可观测：traces / MLflow / Console / 运行页
+          ② 平台层：Databricks SQL Warehouse · Unity Catalog · Delta
+          ① 基准底座：BEAVER → MySQL 参照 → 复制 → 适配 → 冻结 Gold
+横切：Gold 隔离 · 训练 / 开发 / 评测集纪律 · 可复现 · 成本控制 · 安全
 ```
 
-**依赖方向只能自下而上**：上层调用下层，下层不知道上层存在。唯一的"反向"箭头是外层 Loop 根据评测结果去改 ③④ 的配置，这一步刻意保留为人工决策（见第 9 节）。
+**两条最重要的边界**：
+1. **Gold 只出现在三个地方**：底座（冻结 Gold）、评测（Loop 结束后判分）、外循环（离线学习，而且只用训练集）。生成端和内循环在代码层面拿不到当前题的 Gold。
+2. **三份数据各有用途**：训练集（评测集和开发集以外的约 5,650 道已解题）用来**学习**；开发集（30 题）用来**衡量改动**；评测集（89 题）等配置冻结后只跑一次。
 
 ---
 
-## 3. 目录与层的对应
+## 3. 目录与模块对应
 
-| 层 | 目录 | 对应阶段 |
+| 部分 | 目录 / 文件 | 对应阶段 |
 |---|---|---|
-| ① 基准与数据底座 | `benchmark/beaver/`、`scripts/phase0.py`、`scripts/fetch_beaver_db.py`、`config/phase0.yaml` | Phase 0 |
-| ② 平台层 | `execution/`、`dbx/` | Phase 0 起贯穿 |
-| ③ Agent 基线 | `agent/`、`scripts/phase1.py`、`config/phase1.yaml` | Phase 1 |
-| ④ Loop 核心 | `loop_engineer/`、`skills/`、`scripts/phase4.py`–`phase6.py` | Phase 4–6 |
-| ⑤ 评测与分析 | `evaluation/`、`benchmark/beaver/evaluator.py`、`benchmark/beaver/subtasks.py`、`scripts/phase3.py` | Phase 1/3/4/6 |
-| ⑥ 可观测与展示 | `dbx/publish.py`、`dbx/tables.py`、`scripts/publish_run.py`、`app/` | Phase 1 起、Phase 9 |
-| ⑦ 外层 Loop / 治理 | `docs/`（ROADMAP、EXECUTION_LOG、决策 D1–D5） | 全程 |
-| 测试 | `tests/`（127 个） | 全程 |
+| ① 基准底座 | `benchmark/beaver/`、`scripts/phase0.py`、`scripts/fetch_beaver_db.py`、`config/phase0.yaml` | Phase 0 |
+| ② 平台层 | `execution/`、`dbx/` | 贯穿全程 |
+| ③ 生成端 | `agent/`（retriever、generator、examples、knowledge、llm、join_graph、sql_analysis） | Phase 1 起 |
+| ④ 内循环 | `loop_engineer/`（controller、verifier、checks、observer、diagnose、policy）、`skills/` | Phase 4–6 |
+| ⑤ 外循环 | `scripts/analyze_run.py`、`scripts/build_knowledge.py`、`scripts/*_eval.py`、`loop_engineer/judge.py`、`loop_engineer/validators.py` | 优化阶段 |
+| ⑥ 评测 | `benchmark/beaver/evaluator.py`、`benchmark/beaver/subtasks.py`、`evaluation/` | Phase 1/3/4/6 |
+| ⑦ 可观测与平台 | `dbx/publish.py`、`app/`、`app.yaml`、`scripts/publish_run.py`、`scripts/build_app_bundle.py`、`scripts/deploy_app.py` | Phase 9 |
+| 配置 | `config/phase0.yaml`、`config/phase1.yaml`、`.env`（不入库） | — |
+| 测试 | `tests/`（165 个） | — |
 
 ---
 
 ## 4. ① 基准与数据底座（Phase 0）
 
-### 实现
+**要解决的问题**：BEAVER 的官方引擎是 MySQL，项目跑在 Databricks 上。换了引擎，标准答案还成不成立？没有这一步，后面所有准确率都没有可信度。
 
-| 步骤 | 做什么 | 代码 |
-|---|---|---|
-| 取数 | 学员自己申请 HF 门控数据集，下载题目和 `beaver_db.zip`（MySQL dump） | `scripts/fetch_beaver_db.py`、`benchmark/beaver/loader.py` |
-| 参照库 | 本地 MySQL 8.0 还原 dump，作为 BEAVER 官方口径的"标准答案机" | `execution/mysql.py` |
-| 复制 | 97 张表从 MySQL 复制到 Databricks Delta（`self_healing_text2sql.dw`），逐表校验行数 | `benchmark/beaver/replicate.py` |
-| 兼容性 | 每道题的 Gold SQL 在两个引擎上各跑一次，比较结果 | `benchmark/beaver/compatibility.py`、`benchmark/beaver/phase0.py` |
-| 适配 | 两条有记录、经结果验证的方言规则：`VARIANCE/STD/STDDEV → VAR_POP/STDDEV_POP`；非聚合窗口函数去掉 frame 子句。**Gold SQL 原文不改**，改写版本单独存放 | `benchmark/beaver/adapter.py` |
-| 比较 | `cross_engine_v2`：DECIMAL 按自身精度比较，浮点相对误差 1e-6，大结果集用分桶匹配 | `benchmark/beaver/evaluator.py:134` `cross_engine_match` |
-| 冻结 | 通过的题把 Gold 结果写入 `benchmark.gold_results`，之后评测只读这张表 | `dbx/tables.py:83` `GOLD_RESULTS` |
+**逻辑**
 
-结果：严格比较只有 37/100 一致 → 分析出三类根因（总体方差和样本方差、小数精度、窗口 frame）→ 适配后 **89 道 PRIMARY 题**（原样通过 46 + 规则适配 43）。
+```
+下载 BEAVER（HF 门控数据集，学员自己申请访问）→ MySQL 还原（参照库）
+→ 97 张表复制到 Delta（逐表核对行数和列画像）
+→ 每道题的 Gold SQL 在两个引擎上各跑一次，比较结果
+→ 不一致的，查明原因，加有文档记录、经过结果验证的适配规则
+→ 通过的题把 Gold 结果冻结到 benchmark.gold_results
+```
 
-### 价值
-- 解决"换了执行引擎，标准答案还对不对"的问题。没有这一步，后面所有准确率都没有可信度。
-- 冻结 Gold 后，每次评测不再依赖 MySQL，结果可复现，也不会因为重算 Gold 而悄悄变化。
+| 模块 | 设计原理 |
+|---|---|
+| `replicate.py` 复制 | 按列映射类型；MySQL 的 `_ci`（不区分大小写）排序规则映射为 Databricks 的 `UTF8_LCASE`，保证字符串比较行为一致 |
+| `compatibility.py` 兼容性 | 同一条 Gold SQL 在两个引擎上重复执行，对错误分类，识别结果不稳定的题 |
+| `adapter.py` 适配 | **只加两条规则、不改原始 Gold**：`VARIANCE/STD/STDDEV → VAR_POP/STDDEV_POP`（MySQL 这几个函数是总体统计）；非聚合窗口函数去掉 frame 子句。改写后的 SQL 另存，原文保留 |
+| `evaluator.py` 比较 | 官方口径：按结果集比较，不比 SQL 文本，列顺序算数。跨引擎比较只放宽数值表示差异：DECIMAL 按各自精度比较，浮点相对误差 1e-6，大结果集分桶匹配 |
+| 冻结 Gold | 之后的判分只读冻结的结果，不依赖 MySQL，可复现，也不会因为重新计算而悄悄变化 |
 
-### 面试重点
-1. **先证明基准可用，再做 Agent**："我第一步没写 Agent，而是先证明 BEAVER 搬到 Databricks 后答案还成立。严格比只有 37% 一致，逐条查出三类方言差异，用两条规则补回，最后 89 道可用。"
-2. **不改 Gold，只加适配层**：适配规则是文档化、可审计、经结果验证的，原始 SQL 永远不动。这是评测诚信问题。
-3. **比较规则要写死**：按答案（结果集）比，不按 SQL 文本比；列顺序算数；跨引擎只放宽数值表示差异。
+**结果**：严格比较只有 37/100 一致，查出三类方言差异后补上两条规则，**最终 89 道可用**（原样 46 + 适配 43）。
 
 ---
 
 ## 5. ② 平台层（Databricks）
 
-### 实现
-
-| 组件 | 做什么 | 代码 |
+| 模块 | 做什么 | 设计原理 |
 |---|---|---|
-| SQL 执行器 | 连 SQL Warehouse；只允许单条只读语句；统一会话设置（ANSI 关、超时 120s、关结果缓存）；超大结果返回 `TOO_MANY_ROWS`；报错时抽出错误类别 | `execution/databricks_sql.py:106` `execute` |
-| 统一结果对象 | `ExecutionResult(status, rows, columns, error, error_class, elapsed_ms)`，MySQL 和 Databricks 共用 | `execution/base.py` |
-| Catalog 布局 | 一个 catalog `self_healing_text2sql`，5 个 schema：`benchmark`、`dw`、`traces`、`evaluation`、`experience` | `dbx/catalog.py` |
-| 表结构 | 所有 Delta 表的 Arrow schema 集中定义 | `dbx/tables.py` |
+| `execution/databricks_sql.py` | 连接 SQL Warehouse、执行、返回统一的 `ExecutionResult` | **只允许单条只读语句**；会话设置统一（ANSI 关、超时 120 秒、关结果缓存）；结果超过 50 万行返回 `TOO_MANY_ROWS`，防止笛卡尔积；报错时抽出错误类别，比如 `UNRESOLVED_COLUMN` |
+| `execution/mysql.py` | MySQL 参照引擎 | 和 Databricks 执行器接口相同，两个引擎可以互换比较 |
+| `dbx/catalog.py` | Catalog 布局、写 Delta | 一个 catalog、5 个 schema，按**权限边界**划分：`benchmark`（Gold）、`dw`（数仓表）、`traces`（Agent 可见）、`evaluation`（判分结果）、`experience`（知识库，预留）；先写 parquet 到 staging volume，再 `INSERT ... BY NAME` |
+| `dbx/tables.py` | 所有 Delta 表的 Arrow schema | 字段定义只在一个地方维护 |
 
-```python
-# execution/databricks_sql.py:112-130（节选）
-if not is_read_only(sql, "mysql") and not is_read_only(sql, "databricks"):
-    return ExecutionResult(self.engine, "REJECTED", error="not a single read-only statement")
-...
-if max_rows is not None and len(rows) > max_rows:
-    return ExecutionResult(self.engine, "TOO_MANY_ROWS", ...)
-...
-except Exception as e:
-    cls = extract_error_class(msg)          # 例如 UNRESOLVED_COLUMN.WITH_SUGGESTION
-    status = "TIMEOUT" if timed_out else "ERROR"
-```
-
-### 价值
-- **执行器就是 Loop 的"传感器"**：Databricks 报错信息结构化（错误类别 + 未解析的列 + "Did you mean" 候选），这是后面规则诊断能做到不调 LLM 的前提。
-- `traces` 和 `evaluation` 物理分开，从存储层面保证"Agent 看得到的"和"判分用的"不混在一起。
-
-### 面试重点
-1. **错误信息是免费的诊断信号**：`[UNRESOLVED_COLUMN.WITH_SUGGESTION] ... ata.DEPARTMENT_CODE cannot be resolved. Did you mean [sd.DEPARTMENT_CODE ...]`，一条报错就给出了错误类型、出错位置和候选修复。
-2. **安全护栏**：生成的 SQL 只能只读、单语句；有行数上限防止笛卡尔积打爆仓库。
-3. **Schema 分层对应权限边界**：`traces.*` 永远不含 Gold 衍生字段。
+**设计要点**：
+- **执行器是 Loop 的"传感器"**：Databricks 的报错是结构化的，包括错误类别、找不到的列、"Did you mean" 候选。这是后面规则诊断不需要调用 LLM 的前提。
+- **`traces` 和 `evaluation` 物理上分开**：从存储层面保证"Agent 能读的"和"判分用的"不混在一起。
 
 ---
 
-## 6. ③ Agent 基线（Phase 1）
+## 6. ③ 生成端 Agent
 
-### 实现
+**要解决的问题**：给一道自然语言问题，从 97 张表的数仓里生成一条正确的 SQL。
 
-| 组件 | 做什么 | 代码 |
-|---|---|---|
-| 表检索 | BM25，表名/列名/样例值分字段加权（3/2/1），取 k=20。k 在评测集以外的题上调 | `agent/retriever.py:147` `retrieve` |
-| SQL 生成 | Few-shot（示例只取评测集以外的题），prompt `baseline-v2`，含 MySQL→Databricks 统计函数对照 | `agent/generator.py:130` `generate`、`agent/generator.py:98` `build_prompt` |
-| LLM Client | 智谱 OpenAI 兼容接口；`do_sample=False`；可重试状态码指数退避；`UsageMeter` 限制调用次数和 token；`CachingChatClient` 按 (模型, 参数, system, prompt) 的 SHA-256 指纹缓存 | `agent/llm.py:106` `ZhipuChatClient`、`agent/llm.py:171` `CachingChatClient` |
-| SQL 分析 | sqlglot 解析 → 别名还原成真实表名、抽取列/关联/运算 | `agent/sql_analysis.py:93` `alias_map` |
-| Join 图 | 从 schema 推断可关联的键（同名 `_CODE/_KEY/_ID` 等列） | `agent/join_graph.py:29` `join_candidates` |
+**逻辑**
 
-基线规则：`setting=0`（不给任何标注）、一次生成、不重试。
-
-**真实结果**（评测集 89 题，只跑一次）：首次准确率 **2/89 = 2.25%**，可执行 21/89；68 题报错，其中 `UNRESOLVED_COLUMN` 58 题。开发集 30 题：0/30，**21 个列报错中 20 个，这个列其实就在另一张已选中的表里**，是把列挂到了错误的别名上。
-
-### 价值
-- 提供"修复前"的对照组，所有 Loop 指标都相对它计算。
-- 报错分布直接指出了 Loop 应该优先做什么（列挂错表 → `SchemaSearch`）。
-
-### 面试重点
-1. **基线要"老实"**：不给提示、不重试、一次出结果，否则 Loop 的提升说不清。
-2. **缓存 + 贪心解码 = 可复现**：同一 prompt 永远拿到同一回答；多个实验组的第 1 次尝试完全相同（直接重放缓存），对比才公平，也省钱。
-3. **数据驱动定方向**：不是凭感觉设计技能，而是先看基线的错误分布。
-
----
-
-## 7. ④ Loop 核心（Phase 4–6）——项目重点
-
-### 7.1 结构
-
-```mermaid
-flowchart LR
-    G["Generate<br/>attempt 1"] --> E["Execute"] --> V{"Verify<br/>SelfVerifier"}
-    V -- PASS --> F["Final 选择"]
-    V -- "FAIL 且还有预算" --> O["Observe<br/>白名单"] --> D["Diagnose<br/>规则优先 → LLM"] --> P["Policy<br/>类型→技能 映射表"] --> S["Skill.repair<br/>确定性优先 → LLM"]
-    S -- "attempt n+1" --> E
-    V -- "FAIL 且预算用完" --> F
+```
+问题 → BM25 检索 20 张候选表 →（可选）相似题示例：检索 4 道已解题，并把它们用到的表补进 schema
+     →（可选）数仓使用说明：本题相关的用表约定和关联约定
+     → prompt = 规则 + schema + 示例 + 使用说明 + 问题 → LLM → 抽取 SQL
 ```
 
-| 模块 | 输入 → 输出 | 关键设计 | 代码 |
+| 模块 | 设计原理 |
+|---|---|
+| `retriever.py` BM25 检索 | 文档由表名、列名、样例值组成，权重 3/2/1；k=20 是在评测集以外的题上调出来的拐点（召回 0.91）。**确定性**：分数相同时按表名排序 |
+| `generator.py` 生成 | prompt 规则里写明这个数仓的**通用约定**（方言、字符串不区分大小写、统计函数对应），但不包含任何具体题目的信息。三种模式：`baseline-v2`（固定 3 个示例）、`baseline-v3-dynfs`（相似题示例）、`+kb`（加数仓使用说明） |
+| `examples.py` 相似题示例 | 示例库 = 训练集已解题（**排除评测集和开发集**，5,508 道），按问题文本做 BM25；示例用到的表补进 schema（最多 6 张）。原理：同类问题在这个数仓里用哪些表、怎么关联，用已解题直接示范 |
+| `knowledge.py` 数仓使用说明 | 从训练集统计三类约定：概念 → 常用表（IDF 加权）、相似表组（列名相似度 ≥ 0.5）在同类问题里的使用比例、每对表常用的关联键和 INNER / LEFT 比例。每题只取相关的约 10 行 |
+| `llm.py` LLM 客户端 | 一个 OpenAI 兼容客户端，按配置切换智谱和 DeepSeek。**贪心解码 + prompt 指纹缓存**：同一个 prompt 永远拿到同一个回答，各实验组的第 1 次生成逐字相同，对比才公平，也省钱。`UsageMeter` 限制调用次数和 token；key 只从 `.env` 或 secret 读取 |
+| `join_graph.py`、`sql_analysis.py` | 从 schema 推断候选关联键；用 sqlglot 解析 SQL，把别名还原成真实表名。供诊断和修复技能使用 |
+
+**数据**（开发集 30 题，只生成一次、不修复）：
+
+| 模型 / 模式 | 固定示例 | 相似题示例 | 相似题示例 + 使用说明 |
 |---|---|---|---|
-| **LoopController** | `AgentTask` → `LoopResult(attempts, rows, final_index)` | 两个实验组（targeted / generic）共用一个控制器，只有"如何产生下一次尝试"不同；预算 = 最多 2 次 SQL 尝试 | `loop_engineer/controller.py:95` `run` |
-| **Verifier** | attempt + rows → `VerifierDecision(passed, mode, signals)` | 主实验只用 **SelfVerifier**（无 Gold 信号：没 SQL / 报错 / 结果过大 / 空结果 / 整列 NULL）；OracleVerifier 只做上界，泄露 1 bit Gold，结果单独标注 | `loop_engineer/verifier.py:25` |
-| **Observer** | attempt 记录 → `Observation` | **白名单**只放 10 个字段；从报错文本解析出错误类别、未解析列、候选列、缺失表 | `loop_engineer/observer.py:46` `observe` |
-| **Diagnoser** | Observation + schema → `Diagnosis(failure_type, confidence, reason, source, repair_hints)` | 有报错走规则（在 schema 里定位这个列：错别名 / 表已检索未使用 / 没检索到 / 凭空编造）；没有报错才调 LLM；`repair_hints` 把证据传给技能 | `loop_engineer/diagnose.py:70` `diagnose_by_rules`、`:165` `diagnose` |
-| **Policy** | Diagnosis → `Route(skill, fallback, reason)` | 映射是**数据**不是代码，消融只需换表或禁用技能 | `loop_engineer/policy.py:27` `TARGETED`、`:52` `route` |
-| **Repair Skills** | Observation + Diagnosis + `RepairContext` → `RepairResult` | 统一接口；能确定性修的不调 LLM；需要 LLM 时共用 `REPAIR_TEMPLATE`，只替换 instruction 和 schema 范围 | `skills/base.py:44` `RepairSkill`、`:50` `REPAIR_TEMPLATE` |
+| glm-4-flash 答对 / 能执行 | 0 / 4 | 3 / 16 | **5** / 16 |
+| deepseek-flash 答对 | 3 | — | — |
 
-5 个技能 + 1 个占位：
-
-| 失败类型 | 技能 | 做法 | 代码 |
-|---|---|---|---|
-| COLUMN_MAPPING | `SchemaSearch` | 先用 sqlglot 按作用域把每个挂错别名的列改到唯一拥有它的表（确定性）；有 join 自等式守卫；剩下的交给 LLM | `skills/schema_search.py:39` `fix_column_refs` |
-| TABLE_RETRIEVAL | `RetrieveAgain` | 把真正拥有该列的表加进 schema，附上推断出的关联键 | `skills/retrieve_again.py:22` |
-| JOIN_KEY | `FindJoinPath` | 给出当前用到的表之间的候选关联键 | `skills/find_join_path.py:15` |
-| QUERY_DECOMPOSITION / DOMAIN_KNOWLEDGE | `ReplanQuery` | 要求先拆子问题再写 CTE | `skills/replan_query.py:20` |
-| EXECUTION / UNKNOWN | `RepairSQL` | 按错误类别附 Databricks 语法注意事项 | `skills/repair_sql.py:19` |
-| （预留）DOMAIN_KNOWLEDGE | `RetrieveKnowledge` | 占位：需要不含 Gold 的知识源 | `skills/retrieve_knowledge.py:15` |
-
-### 7.2 价值
-- 把"自我修复"从一句 prompt（"请检查并修正"）拆成 **可单独评测、可单独替换** 的 5 个环节：触发 / 观察 / 诊断 / 路由 / 修复。
-- 每个环节都有自己的指标：Verifier 用混淆矩阵，Diagnoser 用诊断准确率，Skill 用单技能执行率和恢复率，整体用 Recovery / Harm / Net Gain。
-
-### 7.3 真实结果（开发集 30 题，glm-4-flash，每组最多 2 次尝试）
-
-| 实验组 | 可执行（首次 → 最终） | 答对（首次 → 最终） | 额外 token |
-|---|---|---|---|
-| Targeted + Self | 4 → **9** | 0 → 0 | 369,635 |
-| Generic + Self | 4 → 6 | 0 → 0 | 361,964 |
-| Targeted + Oracle（上界） | 4 → 9 | 0 → 0 | 412,048 |
-| Generic + Oracle（上界） | 4 → 6 | 0 → 0 | 401,656 |
-
-- 在**相同预算、几乎相同 token** 下，定向修复让可执行数比通用重试多 50%（9 vs 6）。
-- 答对数都是 0：干预实验已证明这个模型即使拿到 5 类 Gold 提示也修不好（0/30），这是决策 D4 预见的结果。**这一轮数据只证明流程通，不作为效果结论。**
-- 规则诊断在评测集上宽松准确率 **76.5%**（68 题），LLM 诊断在这个模型上基本无效（严格 0/19）。
-
-### 7.4 面试重点
-1. **为什么不是一句"请自我修正"**：通用重试不知道错在哪，只能让模型重猜；定向修复把错误信号变成结构化证据，再选工具。数据：可执行 9 vs 6。
-2. **规则优先、LLM 兜底**：报错里已经有答案的就不花 token；76.5% vs LLM 0/19 说明这不是偷懒，而是更准。
-3. **确定性修复优先**：`SchemaSearch` 能用 schema 查表解决的就不调 LLM；踩过坑（join 条件被改成 `sd.X = sd.X` 自等式，能跑但语义错），加了守卫，Phase 5 的虚高数字 4→10 被修正为 4→8。**主动发现并修正自己的虚高结果是很好的面试故事。**
-4. **Self vs Oracle**：业界很多"自我修正"论文用 Gold 判断是否该修，等于偷看答案；本项目主实验只用生产环境拿得到的信号，Oracle 只作上界。
-5. **Policy 是数据**：一行 `--disable SchemaSearch` 就能做消融，不改代码。
+**设计要点**：错误分析显示，能执行但答错的主要原因是**在相似表之间选错了**（漏用的表 34/41 其实已经检索到）。所以生成端的改进方向是"告诉模型这个数仓的习惯"，而不是检索更多的表。
 
 ---
 
-## 8. ⑤ 评测与分析
+## 7. ④ 内循环 Loop（运行时）
 
-### 实现
+**要解决的问题**：第一次生成失败时，Loop 在**不看标准答案**的前提下，自己发现失败、判断原因、有针对性地修复。
 
-| 组件 | 做什么 | 代码 |
-|---|---|---|
-| EX 判定 | 对比冻结 Gold 结果（官方口径：行的字符串集合，列顺序算数；跨引擎数值容差） | `benchmark/beaver/evaluator.py:40` `official_match`、`evaluation/baseline.py:48` `gold_judge` |
-| 开发集 | 评测集以外 30 题，种子 20260926，Gold 在 MySQL 上实时算；所有调参只在这里做（D2） | `evaluation/devset.py` |
-| 失败标注器 | 把生成 SQL 和 Gold SQL 都解析成语法树，逐项对比表/列/关联/常量/运算，给出主因 + 多标签。参照 = 标注 ∩ Gold SQL（标注多列了表的题占 18%） | `benchmark/beaver/subtasks.py` |
-| 干预实验 | 每次只补一类 Gold 提示，看能否修好，用来找因果（仅离线分析） | `evaluation/intervention.py:86` |
-| 诊断准确率 | Diagnoser 的输出对比标注器标签，分严格/宽松、规则级/LLM 级 | `evaluation/diagnosis_eval.py:18` `score` |
-| Loop 指标 | 循环跑完之后才判分：Recovery Rate、Harm Rate、Net Gain、Verifier 混淆矩阵、单技能统计、成本 | `evaluation/loop_run.py:35` `run_arm`、`:67` `summarize` |
-
-### 价值
-- **先判断"能不能修"，再判断"修得好不好"**：干预实验得出"瓶颈在模型能力而不是信息"，避免在错误方向上继续堆技能。
-- Harm Rate 专门衡量"把原本对的改错了"，这是自我修正系统最容易忽略的风险。
-
-### 面试重点
-1. **判分和循环严格分离**：Loop 运行时看不到对错；跑完才用 Gold 判分（`loop_run.py:45-48`）。
-2. **开发集 / 评测集纪律**：评测集只在配置冻结后跑一次，防止在考题上调参。
-3. **干预实验的结论**：5 类 Gold 提示全给也是 0/30 → 换更强模型是下一步最有价值的动作，而不是再加技能。
-4. **根因 vs 直接原因**：诊断最大的混淆"选表 → 列映射"（31 题）——报错只看到"列挂错别名"，但更深层是"少用了一张表"。能说清这一点说明真的看过数据。
-
----
-
-## 9. ⑥ 可观测与展示
-
-### 实现
-
-| 组件 | 做什么 | 代码 |
-|---|---|---|
-| 本地运行目录 | 每次运行一个目录：`run_meta.json`、`results.jsonl`（每题所有尝试）、`summary.json` | `evaluation/loop_run.py:37-63` |
-| Trace 表 | 每次尝试一行：检索、SQL、执行状态、verifier 决定和信号、诊断类型/置信度/理由、修复技能/理由、token、延迟 | `dbx/tables.py:53` `EXECUTION_TRACES`、`dbx/publish.py:35` `flatten_loop_records` |
-| 评测表 | `evaluation.evaluation_results`（对错）、`evaluation.runs`（汇总）、`failure_labels`、`diagnosis_eval` | `dbx/tables.py:69`、`:76` |
-| MLflow | 每个 run 记录参数（模型、prompt 版本、策略、verifier）和指标 | `dbx/publish.py:111-150` |
-| Loop Debug Console | Streamlit：实验组对比、单题逐次尝试回放、诊断分布、技能统计；为 Phase 7/8 预留区块 | `app/dashboard.py`、`app/data.py` |
-
-### 价值
-- 每一次修复都能回答"为什么修、修了什么、修完怎样"，可以逐题复盘。
-- 看板直接读 Delta 表，新的运行发布后自动出现。
-
-### 面试重点
-1. **Trace 是 Loop 的调试器**：没有逐次尝试的 trace，Loop 出问题只能猜。dw_4188 的自等式 bug 就是在 trace 里看到"能执行但 join 没意义"才发现的。
-2. **Trace 不含 Gold**：`traces.*` 可以给 Agent 回读（未来做经验库 `experience` schema），`evaluation.*` 只给人看。
-
----
-
-## 10. ⑦ 外层 Loop / 治理
-
-内层 Loop 修的是**单道题**；外层 Loop 修的是**系统本身**（prompt、模型、技能、策略）。
+**逻辑**
 
 ```
-开发集跑实验 → 看指标和 trace → 找出最大的失败类别 → 改配置/技能 → 开发集再跑
-                                                  ↓（满意后冻结）
-                                         评测集只跑一次 → 写入 EXECUTION_LOG
+执行 → 自检 ─通过→ 结束
+          └未通过→ 观察（白名单）→ 诊断（规则优先）→ 路由（查表）→ 技能修复 → 回到执行
+最多 (最大修复次数 + 1) 次尝试；最终答案 = 最后一次自检通过的 > 最后一次能执行的 > 最后一次
 ```
 
-本项目里外层 Loop 是**人工 + 文档化**执行的：每一个改动都记在 `docs/EXECUTION_LOG.md` 的决策表（D1–D5）和问题表（#1–#8）里，写明依据的数据。
-
-| 例子 | 触发的数据 | 做的改动 |
+| 模块 | 输入 → 输出 | 设计原理 |
 |---|---|---|
-| D2 | 26/89 题干含 MySQL 函数名，和 prompt 规则冲突 | prompt 升级 `baseline-v2`，建立开发集 |
-| Phase 5 v2 | 引擎只报第一个错列，修一个下一个又报错 | `SchemaSearch` 改为一次修所有列 |
-| 问题 #8 | trace 中出现 `sd.X = sd.X` | 加 join 自等式守卫，重跑并归档旧结果 |
-| D4 | 干预实验 0/30 | 确认瓶颈在模型，保留模型先跑通流程 |
+| `controller.py` LoopController | 题面 → 所有尝试 + 最终答案 | **一个控制器驱动两个实验组**：targeted 组（诊断 + 定向修复）和 generic 组（只说"请修正"），差别只在如何产生下一次尝试，预算相同；每一步发出事件（`on_event`），只通知、不影响 Loop |
+| `verifier.py` + `checks.py` 自检 v2 | 尝试 + 结果 → 通过 / 未通过 + 信号 | **只用生产环境拿得到的信号**。三层：显式失败（报错、空结果等）、4 条结构规则（关联条件恒为真、JOIN 缺条件、缺少分组、四舍五入）、6 条数值一致性规则（由**代码**核对，不用 LLM 推理）。**只有离线评估中误报接近 0 的信号才能触发修复**，其余只作提示。"通过"只表示没发现问题，不代表答案正确 |
+| `observer.py` 观察 | 尝试记录 → 结构化信号 | **白名单**：只放行 12 个 Agent 可见的字段，Gold 相关字段天然进不来；从报错中解析出错误类别、找不到的列、候选列、缺失的表 |
+| `diagnose.py` 诊断 | 信号 + schema → 失败类型、置信度、证据 | **规则优先**：报错里已有答案时只做一次 schema 查找（列在已用的表里 → 挂错别名；在检索到但没用的表里 → 选表……）；自检发现的语义问题按映射表归类；只有 SQL 能跑但结果可疑时才调用 LLM。`repair_hints` 把证据原样传给技能 |
+| `policy.py` 路由 | 失败类型 → 技能 | **映射写成数据**：消融只需换表或禁用技能，不改代码；兜底路由会记录在 trace 里 |
+| `skills/` 修复技能 | 观察 + 诊断 + 上下文 → 新 SQL + 内部过程记录 | **接口统一**；**能确定性修复就不调 LLM**（SchemaSearch 按 schema 修正别名，并用关联条件守卫防止"修成 x = x"）；需要 LLM 时共用一个模板，只替换定向指令和给出的表；`details` 记录每个决定；技能禁止导入 benchmark / evaluation，由测试强制检查 |
 
-### 面试重点
-- **内层 vs 外层**：内层是运行时自动的（每题最多 2 次）；外层是研发流程，自动化外层（自动调 prompt）风险是过拟合开发集，所以保留人工决策 + 冻结评测。
-- **能讲出每个决策背后的数字**，比讲框架更有说服力。
+5 个技能：SchemaSearch（列映射）、RetrieveAgain（选表）、FindJoinPath（关联键）、ReplanQuery（查询拆解、领域知识兜底）、RepairSQL（执行错误、兜底）；RetrieveKnowledge 预留给外循环的知识库。
+
+**数据**：
+- 同样的预算下，定向修复比通用重试多修好 3 道可执行题（glm：4→9 vs 4→6）；
+- 但两个模型上，答对的题数都没有因为修复而增加（deepseek：能执行 24→29，答对 3→3）。
+
+**设计要点**：内循环擅长兜住**显式失败**。"能执行但语义错"在这个基准上无法靠自检可靠发现，见 §8，所以它的定位是"兜底"，不是"提升准确率的主力"。
+
+---
+
+## 8. ⑤ 外循环（离线学习与方法评估）
+
+**要解决的问题**：内循环修不了"能执行但答错"。答错的根源是**不知道这个数仓的约定**，这些约定只能从已解题中学。同时，任何想加进 Loop 的方法，都要先证明有效。
+
+**逻辑**
+
+```
+跑一批题（开发集只用于衡量）→ analyze_run 逐题对照 Gold 找错因、分类
+→ 从训练集归纳通用知识（不看开发集错题的答案）：相似题示例库、数仓使用说明
+→ 知识交给生成端 → 回到开发集衡量效果 → 有效才保留
+```
+
+| 模块 | 设计原理 |
+|---|---|
+| `scripts/analyze_run.py` 错误分析 | 拉取一次运行的 trace，最终答案和 Gold 逐项对照：用表、列、关联键、字面值、统计运算、行数、列数；输出主因分布，用来决定下一步补哪类知识 |
+| `agent/examples.py`、`agent/knowledge.py` 知识资产 | **只从训练集归纳，运行时只读**；学到的是通用规律（比如"研究生信息在哪张表"），而不是"第 N 题的答案" |
+| `scripts/verifier_eval.py`、`judge_eval.py`、`validator_eval.py` 方法评估 | 每个候选自检方法都测**抓错率**（在能执行但答错的尝试上）和**误报率**（在正确答案和 Gold SQL 上），数据决定"触发修复 / 只作提示 / 不用" |
+| `loop_engineer/judge.py`、`validators.py` | LLM 裁判、查数据库的验证器（过滤值存在性、关联放大）。已经评估过，代码保留，目前只作提示 |
+
+**为什么不能把开发集错题的原因直接交给 Loop**：错因是拿 Gold 比出来的。交给 Loop 等于看答案改考卷，生产环境做不到，开发集也会失去衡量作用。正确的做法是**从训练集学通用知识、在开发集上衡量**。
+
+**数据**（四轮自检实验的结论，以及错误分类）：
+
+| 自检方法 | 抓到错题 | 误伤正确答案 | 结论 |
+|---|---|---|---|
+| 对照题干的规则 | 安全的规则抓不到，能抓的误报高 | — | 只接入安全规则 |
+| LLM 裁判（glm / deepseek） | 10/30、27/30 | 4/33、**31/33** | 不接入：BEAVER 的题干和 Gold 本身常不一致 |
+| 数值一致性 | 0/22 | 0/378 | 接入：零误报 |
+| 查数据库的验证器 | 0/30、5/30 | 0/33、7/33（Gold 抽样 22%） | 只作提示 |
+
+错误分类（deepseek + 相似题示例 + Loop，21 道能执行但错）：
+- 选错表 38%、关联方式 19%，这两类（57%）可以从已解题中学习；
+- 查询结构 19%、过滤理解 10%；
+- 基准噪声 14%，无法消除。
+
+**设计要点**：**分清信号能学什么**。
+- 执行反馈（报错 → 修复后能运行）只能学"可执行性"知识，比如列属于哪张表、方言规则；修复后能运行的 SQL 不能当作正确示例。
+- 语义知识需要 Gold 或人工标注，只在训练集上学。
+
+---
+
+## 9. ⑥ 评测
+
+| 模块 | 设计原理 |
+|---|---|
+| 事后判分 `evaluation/loop_run.py` | **Loop 返回后才调用判定器**；对错存在单独的字段，不写回尝试记录；发布时尝试进 `traces`，对错进 `evaluation` |
+| 指标 `summarize` | 首次 / 最终准确率、**恢复率**（首次错、最终对）、**误伤率**（首次对、最终错）、净收益、自检混淆矩阵、单技能统计、每净恢复一题的额外 token |
+| 开发集 `evaluation/devset.py` | 评测集以外 30 题，种子固定，Gold 由 MySQL 实时计算；**所有调参只在开发集上做**（决策 D2） |
+| 失败标注器 `benchmark/beaver/subtasks.py` | 把生成 SQL 和 Gold SQL 都解析成语法树逐项比较，给出主因和多标签；参照 = BEAVER 标注 ∩ Gold SQL 实际用到的（标注多列了表的题占 18%） |
+| 干预实验 `evaluation/intervention.py` | 每次只补一类 Gold 提示，看能不能修好，用来区分"缺信息"还是"模型能力不够"；结果只作上界，不作为系统能力 |
+| 诊断准确率 `evaluation/diagnosis_eval.py` | 诊断结果对照标注器标签：规则诊断宽松准确率 76.5%，LLM 诊断 0/19 |
+
+**设计要点**：
+- Oracle Verifier 泄露 1 bit Gold（"这题错了"），结果一律标为"上界"；
+- 误伤率专门衡量"把对的改错"，这是自我修正系统最容易忽略的风险。
+
+---
+
+## 10. ⑦ 可观测与平台
+
+| 模块 | 设计原理 |
+|---|---|
+| 运行目录 `runs/` | 每次运行一个目录：`run_meta.json`（模型、prompt 版本、自检版本、示例方式、知识开关）、`results.jsonl`、`summary.json`、`report.md`；**版本号写进元数据**，不同配置的结果不会混淆 |
+| 发布 `dbx/publish.py` | 每次尝试展平成一行写入 `traces.execution_traces`，对错写入 `evaluation.*`，汇总写入 `evaluation.runs` 和 MLflow；**重复发布幂等**（先删同一 run_id）；干预实验只发汇总（那些 SQL 是在 Gold 提示下生成的，不能进 traces） |
+| Loop Debug Console `app/dashboard.py` | 直接读 Delta：总览（含模型对比）、对照实验、消融、逐题追踪、失败与诊断 |
+| 运行 Loop 页 `app/app_pages/run_loop.py` + `app/runner.py` | 网页上选题、选模型、选策略、选修复次数、选示例方式、开关使用说明；**后台线程 + 事件列表**，页面每秒刷新时间线；已完成的题汇总成表，完整过程按需查看；和命令行走同一条执行路径 |
+| 分析报告 `app/report.py` | 运行结束后由事件直接生成，**不调用 LLM**：总体结果、逐次尝试的变化、逐题结局、各环节表现、成本、自动得出的发现；附 3 张图（修复前后柱状图、逐次折线图、逐题状态格子图） |
+| 部署 `scripts/build_app_bundle.py` + `scripts/deploy_app.py` + `app.yaml` | 数据包（schema、示例、开发集、示例库、知识文件；含 BEAVER 内容，不入库，只上传到自己的工作区）；key 放进 secret scope；App 服务主体只授予项目 catalog 权限；评测集在网页上默认锁定 |
+
+**设计要点**：
+- **trace 是 Loop 的调试器**：每一次修复都能回答"为什么修、修了什么、修完怎样"。
+- **"自检通过"和"答对"分开展示**：自检通过但 Gold 判错的题醒目标为"Verifier 漏报"。
 
 ---
 
 ## 11. 横切关注点
 
-| 关注点 | 怎么保证 | 在哪里 |
+| 关注点 | 怎么保证 | 位置 |
 |---|---|---|
-| **Gold 隔离** | Agent 只拿 `AgentTask(case_id, question, db)`；Observer 白名单；技能不许 import `benchmark`/`evaluation`（测试强制）；`oracle_hints` 只在干预实验用 | `benchmark/beaver/dataset.py:75` `agent_view`、`loop_engineer/observer.py:16`、`tests/test_phase5.py:139` |
-| **可复现** | 贪心解码 + prompt 指纹缓存；固定种子（样本 77、开发集 20260926）；run_meta 记录模型/prompt/诊断器版本 | `agent/llm.py:164`、`scripts/phase6.py:99-102` |
-| **成本控制** | `UsageMeter` 限调用次数和 token；缓存重放共享的第 1 次尝试；规则诊断不花 token；报告里有"每净恢复一题的额外 token" | `agent/llm.py:60`、`evaluation/loop_run.py:101` |
-| **公平对比** | 两组共用控制器、verifier、预算；第 1 次尝试完全一致 | `loop_engineer/controller.py:1-17` |
-| **安全** | 只读单语句；结果行数上限；`.env` 和 BEAVER 数据不入库；提交前扫描密钥 | `execution/databricks_sql.py:112`、`.gitignore` |
-| **测试** | 127 个单元测试，覆盖适配、比较、诊断规则、技能、控制器、Gold 隔离 | `tests/` |
+| **Gold 隔离** | Agent 只拿到 `AgentTask`（编号、问题、库名）；Observer 白名单；技能禁止导入 benchmark / evaluation（测试强制）；外循环知识只来自训练集 | `benchmark/beaver/dataset.py` `agent_view`、`loop_engineer/observer.py`、`tests/test_phase5.py` |
+| **数据纪律** | 训练集学习、开发集衡量、评测集冻结后跑一次；示例库和知识库都排除评测集和开发集；做过泄漏检查 | `agent/examples.py`、`agent/knowledge.py`、决策 D2 |
+| **可复现** | 贪心解码 + 指纹缓存；固定种子；运行元数据记录模型、厂商、prompt、自检、诊断器版本和各项开关 | `agent/llm.py`、`scripts/phase6.py` |
+| **用数据做决定** | 新方法先离线测抓错率 / 误报率，或在开发集上做对照，有效才接入；负面结论也记录（决策 V1、V2） | `scripts/*_eval.py`、EXECUTION_LOG |
+| **成本控制** | 调用次数和 token 上限；缓存重放；规则和代码能做的不调 LLM；统计每净恢复一题的 token | `agent/llm.py` `UsageMeter` |
+| **安全** | 只读单语句；行数上限；key 只在 `.env` / secret；BEAVER 数据和 `.env` 不入库；提交前扫描密钥 | `execution/databricks_sql.py`、`.gitignore` |
+| **可测试** | 165 个单元测试，覆盖适配、比较、诊断、技能、控制器、自检、知识、报告、Gold 隔离 | `tests/` |
 
 ---
 
-## 12. 面试 3 分钟讲法（按架构顺序）
+## 12. 面试 3 分钟讲法
 
-1. **问题**（15 秒）：企业数仓的 Text-to-SQL 首次准确率很低（本项目基线 2.25%），需要能自己发现并修复错误的 Agent，而且要能证明修复有效。
-2. **基准**（30 秒）：BEAVER 迁到 Databricks，先证明答案还成立：37% → 89 题可用，Gold 冻结不改。
-3. **基线**（30 秒）：BM25 + few-shot，不给提示、不重试。报错里 58/68 是列挂错表 → 决定 Loop 的第一优先级。
-4. **Loop**（60 秒）：Verify → Observe → Diagnose → Policy → Skill。无 Gold 触发，规则优先诊断（76.5%），确定性优先修复，策略是数据可消融。同预算下可执行 9 vs 6。
-5. **评测诚信**（30 秒）：Self vs Oracle、Harm Rate、开发/评测集分离、主动修正自己虚高的 4→10 为 4→8。
-6. **结论与下一步**（15 秒）：干预实验证明瓶颈是模型能力，下一步换模型在同一套流程上重跑，流程和指标都已就绪。
+1. **问题**（15 秒）：企业数仓 Text-to-SQL 首次准确率很低（基线 2/89）。要做一个能自己修复、并且能证明修复有效的系统。
+2. **底座**（20 秒）：BEAVER 迁到 Databricks，先证明答案还成立：严格一致 37%，补两条适配规则后 89 题可用，Gold 冻结。
+3. **内循环**（50 秒）：执行 → 自检 → 观察 → 诊断 → 路由 → 修复。无 Gold 触发；规则诊断 76.5%；能确定性修复的不调 LLM；路由写成数据，可以做消融。同样的预算下，比通用重试多修好 3 道可执行题。
+4. **关键发现**（40 秒）：修复只增加了能执行的题，没增加答对的题。四轮自检实验（规则、LLM 裁判、数值一致性、查数据库验证）都证明：不看答案发现不了"能跑但语义错"，因为错因是不知道数仓的约定。
+5. **外循环**（40 秒）：从训练集已解题学习约定（相似题示例、数仓使用说明），开发集衡量。glm 答对 0 → 3 → 5；deepseek 加 Loop 后 3 → 8。
+6. **工程纪律**（15 秒）：Gold 隔离、三份数据分工、每个决定都有离线数据、负面结论也记录。

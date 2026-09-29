@@ -334,7 +334,9 @@ with tab_trace:
                 sql, err, ftype = nz(a.generated_sql), nz(a.execution_error), nz(a.failure_type)
                 signals, skill = nz(a.verifier_signals), nz(a.repair_skill)
                 head = (pill(f"第 {a.attempt_id} 次", "acc") + pill(a.execution_status, "ok" if a.execution_status == "SUCCESS" else "bad")
-                        + pill(f"Verifier {a.verifier_decision} {signals or ''}", "ok" if a.verifier_decision == "PASS" else "warn")
+                        + pill(("自检通过" if a.verifier_decision == "PASS" else f"自检未通过 {signals or ''}")
+                               if a.verifier_mode == "self" else f"Oracle {a.verifier_decision}",
+                               "ok" if a.verifier_decision == "PASS" else "warn")
                         + pill("最终答案" if a.final_status == "FINAL" else "被替代", "acc" if a.final_status == "FINAL" else "plain")
                         + pill(f"Gold 判分：{'对' if ok else '错'}（Loop 不可见）", "ok" if ok else "plain"))
                 st.markdown(head, unsafe_allow_html=True)

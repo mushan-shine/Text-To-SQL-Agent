@@ -14,7 +14,9 @@ from typing import Any
 
 # Everything an agent legitimately observes about its own attempt.
 OBSERVABLE_FIELDS = ("case_id", "attempt_id", "question", "retrieved_tables", "generated_sql", "parse_status",
-                     "execution_status", "execution_error", "result_row_count", "result_preview")
+                     "execution_status", "execution_error", "result_row_count", "result_preview",
+                     # the self-verifier's own findings about this attempt (gold-free, see verifier.py)
+                     "verifier_signals", "verifier_findings")
 
 _ERROR_CLASS = re.compile(r"\[([A-Z][A-Z0-9_]+)(?:\.[A-Z0-9_]+)?\]")
 _UNRESOLVED = re.compile(r"name `([^`]+)`(?:\.`([^`]+)`)? cannot be resolved")
@@ -41,6 +43,9 @@ class Observation:
     unresolved_column: str | None = None
     suggestions: tuple[str, ...] = field(default_factory=tuple)
     missing_table: str | None = None
+    # what the self-verifier found on an attempt that ran (e.g. join_tautology), with evidence and repair hints
+    verifier_signals: tuple[str, ...] = field(default_factory=tuple)
+    verifier_findings: tuple[dict, ...] = field(default_factory=tuple)
 
 
 def observe(record: dict[str, Any], db: str) -> Observation:
@@ -63,4 +68,7 @@ def observe(record: dict[str, Any], db: str) -> Observation:
         error_class=m_cls.group(1) if m_cls else ("NO_SQL" if r["parse_status"] in ("NO_SQL", "EMPTY_RESPONSE") else None),
         unresolved_qualifier=qualifier, unresolved_column=column, suggestions=suggestions,
         missing_table=(m_tab.group(1) or m_tab.group(2)) if m_tab else None,
+        verifier_signals=tuple(r["verifier_signals"] or ()),
+        verifier_findings=tuple(json.loads(r["verifier_findings"]) if isinstance(r["verifier_findings"], str)
+                                else (r["verifier_findings"] or ())),
     )

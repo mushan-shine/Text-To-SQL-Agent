@@ -16,7 +16,9 @@ Final answer: the last attempt that passed verification; otherwise the last
 attempt that executed; otherwise the last attempt.
 
 ``run(..., on_event=cb)`` reports every step as ``cb(step, payload)`` (retrieve,
-generate, execute, verify, diagnose, route, repair, final) for live UIs. It only
+generate, execute, verify, observe, diagnose, route, repair, final) for live UIs;
+``repair`` carries the skill's internal ``details`` (deterministic edits, the
+instruction and prompt given to the LLM). It only
 observes: payloads are copies of what goes into the trace anyway, and a failing
 callback never breaks the loop.
 """
@@ -24,14 +26,14 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 from agent.generator import RULES, SYSTEM, extract_sql, render_schema
 from agent.retriever import BM25TableRetriever
 from benchmark.beaver.dataset import AgentTask
 from loop_engineer.diagnose import Diagnoser
-from loop_engineer.observer import observe
+from loop_engineer.observer import OBSERVABLE_FIELDS, observe
 from loop_engineer.policy import Policy
 from skills.base import REPAIR_TEMPLATE, RepairContext, observed_text
 
@@ -94,6 +96,9 @@ class LoopController:
                                         diagnosis="(not diagnosed)", instruction=GENERIC_INSTRUCTION)
         r = self.ctx.client.complete(prompt, system=SYSTEM)
         sql, status = extract_sql(r.text)
+        self._last_details = {"instruction": GENERIC_INSTRUCTION, "schema_tables": list(tables),
+                              "start_sql": obs.generated_sql, "prompt": prompt, "raw_response": r.text[:4000],
+                              "cached": r.cached}
         return {"generated_sql": sql, "parse_status": status, "repair_skill": "GenericRetry",
                 "repair_action": "generic correction prompt", "repair_reason": None, "repair_fallback": False,
                 "used_llm": True, "input_tokens": r.input_tokens, "output_tokens": r.output_tokens,
@@ -111,23 +116,36 @@ class LoopController:
         retrieval = self.retriever.retrieve(task.question, self.cfg.top_k)
         emit("retrieve", tables=list(retrieval.tables), scores=list(retrieval.scores))
         gen = self.generator.generate(task, retrieval.tables)
+        # dynamic few-shot may add the tables of similar solved questions to the schema the model saw
+        shown = list(getattr(gen, "schema_tables", ()) or retrieval.tables)
         attempt = {"case_id": task.case_id, "attempt_id": 1, "question": task.question,
-                   "retrieved_tables": list(retrieval.tables), "generated_sql": gen.sql,
+                   "retrieved_tables": shown, "generated_sql": gen.sql,
                    "parse_status": gen.parse_status, "strategy": self.cfg.strategy,
                    "input_tokens": gen.llm.input_tokens, "output_tokens": gen.llm.output_tokens,
                    "llm_latency_ms": gen.llm.latency_ms, "used_llm": True, "diag_tokens": 0}
         emit("generate", attempt_id=1, sql=gen.sql, parse_status=gen.parse_status,
-             tokens=gen.llm.input_tokens + gen.llm.output_tokens, latency_ms=gen.llm.latency_ms, cached=gen.llm.cached)
+             tokens=gen.llm.input_tokens + gen.llm.output_tokens, input_tokens=gen.llm.input_tokens,
+             output_tokens=gen.llm.output_tokens, latency_ms=gen.llm.latency_ms, cached=gen.llm.cached,
+             schema_tables=len(shown), added_tables=[t for t in shown if t not in retrieval.tables],
+             few_shot=len(getattr(gen, "example_ids", ()) or getattr(self.generator, "examples", []) or []),
+             example_ids=list(getattr(gen, "example_ids", ()) or ()),
+             prompt_version=getattr(self.generator, "prompt_version", None),
+             knowledge_notes=getattr(gen, "notes", "") or "",
+             prompt=gen.prompt, raw_response=gen.raw[:4000])
         attempts, all_rows = [], []
         for n in range(1, self.cfg.max_attempts + 1):
             exe, rows = self._execute(attempt["generated_sql"], task.db, attempt["parse_status"])
             attempt.update(exe)
-            emit("execute", attempt_id=n, **exe)
+            emit("execute", attempt_id=n, sql=attempt["generated_sql"], **exe)
             decision = verifier.verify(attempt, rows)
+            findings = [asdict(f) for f in getattr(decision, "findings", ())]
+            advisories = [asdict(f) for f in getattr(decision, "advisories", ())]
             attempt.update({"verifier_mode": decision.mode, "verifier_decision": "PASS" if decision.passed else "FAIL",
-                            "verifier_signals": list(decision.signals)})
+                            "verifier_signals": list(decision.signals),
+                            "verifier_findings": json.dumps(findings, ensure_ascii=False) if findings else None,
+                            "verifier_advisories": json.dumps(advisories, ensure_ascii=False) if advisories else None})
             emit("verify", attempt_id=n, mode=decision.mode, passed=decision.passed, signals=list(decision.signals),
-                 last=n == self.cfg.max_attempts)
+                 findings=findings, advisories=advisories, last=n == self.cfg.max_attempts)
             attempts.append(attempt)
             all_rows.append(rows)
             if decision.passed or n == self.cfg.max_attempts:
@@ -136,10 +154,17 @@ class LoopController:
             nxt: dict[str, Any] = {"case_id": task.case_id, "attempt_id": n + 1, "question": task.question,
                                    "retrieved_tables": attempt["retrieved_tables"], "strategy": self.cfg.strategy,
                                    "diag_tokens": 0}
+            details: dict[str, Any] = {}
             if self.cfg.strategy == "generic":
                 nxt.update(self._generic_retry(attempt, tuple(attempt["retrieved_tables"])))
+                details = self._last_details
             else:
                 obs = observe(attempt, task.db)   # whitelist: nothing gold-derived reaches diagnosis / repair
+                emit("observe", attempt_id=n, fields=list(OBSERVABLE_FIELDS), execution_status=obs.execution_status,
+                     error_class=obs.error_class, unresolved_qualifier=obs.unresolved_qualifier,
+                     unresolved_column=obs.unresolved_column, suggestions=list(obs.suggestions),
+                     missing_table=obs.missing_table, result_row_count=obs.result_row_count,
+                     retrieved_tables=len(obs.retrieved_tables), verifier_signals=list(obs.verifier_signals))
                 diag, usage = self.diagnoser.diagnose(obs)
                 emit("diagnose", attempt_id=n, failure_type=diag.failure_type, confidence=diag.confidence,
                      reason=diag.reason, source=diag.source, repair_hints=diag.repair_hints,
@@ -157,12 +182,14 @@ class LoopController:
                             "output_tokens": res.output_tokens, "llm_latency_ms": res.latency_ms,
                             "diag_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
                             "tables": list(res.tables)})
+                details = res.details
             attempt["repaired_sql"] = nxt["generated_sql"]
             attempt["repair_skill"] = nxt["repair_skill"]
             emit("repair", attempt_id=n + 1, skill=nxt["repair_skill"], action=nxt.get("repair_action"),
                  used_llm=nxt.get("used_llm"), before_sql=attempt["generated_sql"], sql=nxt["generated_sql"],
-                 parse_status=nxt["parse_status"],
-                 tokens=int(nxt.get("input_tokens") or 0) + int(nxt.get("output_tokens") or 0))
+                 parse_status=nxt["parse_status"], latency_ms=nxt.get("llm_latency_ms") or 0,
+                 diag_tokens=nxt.get("diag_tokens") or 0,
+                 tokens=int(nxt.get("input_tokens") or 0) + int(nxt.get("output_tokens") or 0), details=details)
             attempt = nxt
         passed = [i for i, a in enumerate(attempts) if a["verifier_decision"] == "PASS"]
         executed = [i for i, a in enumerate(attempts) if a["execution_status"] == "SUCCESS"]

@@ -108,7 +108,9 @@ class SchemaSearch:
         if fix.changes and not fix.unresolved:
             return RepairResult(fix.sql, self.name,
                                 f"re-pointed {len(fix.changes)} column reference(s), deterministic: {'; '.join(fix.changes)}",
-                                diagnosis.reason, tuple(sorted(set(alias_map(fix.sql).values()))), False)
+                                diagnosis.reason, tuple(sorted(set(alias_map(fix.sql).values()))), False,
+                                details={"deterministic_changes": fix.changes, "unresolved": [],
+                                         "start_sql": obs.generated_sql})
         # the schema cannot decide the rest: LLM, starting from the partly fixed SQL
         used = sorted(set(alias_map(fix.sql).values()))
         names = [col] if col else []
@@ -116,7 +118,7 @@ class SchemaSearch:
         candidates = list(dict.fromkeys([*h.get("suggestions", []),
                                          *[c for n in names for c in similar_columns(ctx, n, list(obs.retrieved_tables))]]))
         problems = fix.unresolved or [f"{qual + '.' if qual else ''}{col} does not exist there"]
-        joins = ""
+        joins, cands = "", []
         if any("needs a real join key" in p for p in problems):
             cands = [j.sql() for j in join_candidates(ctx.catalog, used)][:10]
             joins = (f"Join keys shared by the tables in the query (from the schema): {'; '.join(cands) or '(none)'}. "
@@ -128,7 +130,10 @@ class SchemaSearch:
         start = obs if not fix.changes else _with_sql(obs, fix.sql)
         action = (f"deterministic: {'; '.join(fix.changes)}; " if fix.changes else "") + \
                  f"LLM rewrite for {len(problems)} unresolved reference(s)"
-        return llm_repair(self.name, start, diagnosis, ctx, [*used, *obs.retrieved_tables], instruction, action)
+        return llm_repair(self.name, start, diagnosis, ctx, [*used, *obs.retrieved_tables], instruction, action,
+                          {"deterministic_changes": fix.changes, "unresolved": problems,
+                           "candidate_columns": candidates, "join_candidates": cands,
+                           "sql_before_deterministic": obs.generated_sql})
 
 
 def _with_sql(obs: Observation, sql: str) -> Observation:

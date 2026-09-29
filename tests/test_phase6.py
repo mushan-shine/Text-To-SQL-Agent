@@ -151,11 +151,15 @@ def test_events_follow_the_loop_steps_and_do_not_change_results():
     events = []
     chat = Chat(lambda n: f"```sql\n{BAD}\n```")
     res = controller(chat).run(TASK, SelfVerifier(), on_event=lambda step, p: events.append((step, p)))
-    assert [s for s, _ in events] == ["retrieve", "generate", "execute", "verify", "diagnose", "route", "repair",
-                                      "execute", "verify", "final"]
+    assert [s for s, _ in events] == ["retrieve", "generate", "execute", "verify", "observe", "diagnose", "route",
+                                      "repair", "execute", "verify", "final"]
     d = dict(events)
+    assert d["observe"]["unresolved_column"] == "NUM_ENROLLED" and d["observe"]["suggestions"] == ["s.NUM_ENROLLED"]
+    assert "correct" not in d["observe"]["fields"]  # the observer whitelist, shown in the UI
     assert d["diagnose"]["failure_type"] == "COLUMN_MAPPING_FAILURE" and d["route"]["skill"] == "SchemaSearch"
     assert d["repair"]["before_sql"] == BAD and d["final"]["final_attempt"] == 2
+    assert d["repair"]["details"]["deterministic_changes"] == ["d.NUM_ENROLLED -> s.NUM_ENROLLED"]
+    assert "Question:" in d["generate"]["prompt"]
     plain = controller(Chat(lambda n: f"```sql\n{BAD}\n```")).run(TASK, SelfVerifier())
     assert [a["generated_sql"] for a in plain.attempts] == [a["generated_sql"] for a in res.attempts]
 
@@ -165,3 +169,52 @@ def test_a_failing_event_callback_never_breaks_the_loop():
         raise RuntimeError("ui crashed")
     res = controller(Chat(lambda n: f"```sql\n{BAD}\n```")).run(TASK, SelfVerifier(), on_event=boom)
     assert res.attempts[-1]["verifier_decision"] == "PASS"
+
+
+def test_generic_retry_event_carries_its_prompt_and_instruction():
+    events = []
+    chat = Chat(lambda n: f"```sql\n{BAD}\n```" if n == 1 else "```sql\nSELECT s.NUM_ENROLLED FROM SUBJECT_OFFERED s\n```")
+    controller(chat, "generic").run(TASK, SelfVerifier(), on_event=lambda s, p: events.append((s, p)))
+    rep = dict(events)["repair"]
+    assert "observe" not in dict(events)  # the generic arm does not observe / diagnose
+    assert rep["details"]["instruction"] == GENERIC_INSTRUCTION and "(not diagnosed)" in rep["details"]["prompt"]
+
+
+TAUT = ("SELECT d.DEPARTMENT_NAME, AVG(s.NUM_ENROLLED) FROM SIS_DEPARTMENT d "
+        "JOIN SUBJECT_OFFERED s ON d.DEPARTMENT_CODE = d.DEPARTMENT_CODE GROUP BY d.DEPARTMENT_NAME")
+GOOD = BAD.replace("d.NUM_ENROLLED", "s.NUM_ENROLLED")
+
+
+def test_semantic_self_check_closes_the_loop_on_a_join_tautology():
+    """Runs and returns rows, yet the join condition compares a column with itself: the v2 self-verifier
+    fails it, diagnosis routes to FindJoinPath and the repair prompt names the problem."""
+    chat = Chat(lambda n: f"```sql\n{TAUT}\n```" if n == 1 else f"```sql\n{GOOD}\n```")
+    events = []
+    res = controller(chat).run(TASK, SelfVerifier(), on_event=lambda s, p: events.append((s, p)))
+    a1, a2 = res.attempts
+    assert a1["execution_status"] == "SUCCESS" and a1["verifier_decision"] == "FAIL"
+    assert a1["verifier_signals"] == ["join_tautology"] and a1["failure_type"] == "JOIN_KEY_FAILURE"
+    assert a1["repair_skill"] == "FindJoinPath" and "compares a column with itself" in chat.prompts[1]
+    assert a2["verifier_decision"] == "PASS"
+    assert dict(events)["observe"]["verifier_signals"] == ["join_tautology"]
+
+
+def test_v1_signal_set_keeps_the_old_behaviour():
+    from loop_engineer.verifier import BASIC_SIGNALS
+    chat = Chat(lambda n: f"```sql\n{TAUT}\n```")
+    res = controller(chat).run(TASK, SelfVerifier(signals=BASIC_SIGNALS))
+    assert len(res.attempts) == 1 and res.attempts[0]["verifier_decision"] == "PASS"
+
+
+def test_numeric_inconsistency_triggers_a_replan():
+    """AVG outside [MIN, MAX] of the same column cannot be right: the self-verifier fails it without any gold,
+    and the diagnosis routes it to ReplanQuery with the inconsistency in the prompt."""
+    sql = ("SELECT d.DEPARTMENT_NAME, AVG(s.NUM_ENROLLED), MIN(s.NUM_ENROLLED), MAX(s.NUM_ENROLLED) "
+           "FROM SIS_DEPARTMENT d JOIN SUBJECT_OFFERED s ON d.DEPARTMENT_CODE = s.DEPARTMENT_CODE "
+           "GROUP BY d.DEPARTMENT_NAME")
+    chat = Chat(lambda n: f"```sql\n{sql}\n```" if n == 1 else f"```sql\n{GOOD}\n```")
+    ex = Exec(rows=[("Math", 50.0, 1, 9)])
+    res = controller(chat, ex=ex).run(TASK, SelfVerifier())
+    a1 = res.attempts[0]
+    assert a1["verifier_decision"] == "FAIL" and a1["verifier_signals"] == ["avg_outside_min_max"]
+    assert a1["repair_skill"] == "ReplanQuery" and "inconsistent" in chat.prompts[1]

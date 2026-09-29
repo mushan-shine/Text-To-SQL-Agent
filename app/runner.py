@@ -22,14 +22,15 @@ import tempfile
 import threading
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 BUNDLE = Path(os.environ.get("SHT_BUNDLE", ROOT / "app" / "bundle"))
 CATALOG = os.environ.get("SHT_CATALOG", "self_healing_text2sql")
-MAX_CASES = int(os.environ.get("SHT_MAX_CASES_PER_RUN", "5"))
+MAX_CASES = int(os.environ.get("SHT_MAX_CASES_PER_RUN", "0"))  # 0 = no limit
+MAX_REPAIRS = int(os.environ.get("SHT_MAX_REPAIRS", "4"))
 MODELS = {"glm-4-flash": "zhipu", "deepseek-flash": "deepseek"}
 
 log = logging.getLogger(__name__)
@@ -63,6 +64,17 @@ class Bundle:
     examples: list
     devset: dict
     config: dict
+    pool_path: Path | None = None
+    _index: Any = None
+
+    def example_index(self):
+        """Dynamic few-shot pool (built lazily; None if the bundle predates it)."""
+        if self._index is None and self.pool_path and self.pool_path.exists():
+            import gzip
+            from agent.examples import ExampleIndex
+            with gzip.open(self.pool_path, "rt", encoding="utf-8") as f:
+                self._index = ExampleIndex.from_rows(json.load(f))
+        return self._index
 
 
 def load_bundle(root: Path = BUNDLE) -> Bundle:
@@ -75,7 +87,7 @@ def load_bundle(root: Path = BUNDLE) -> Bundle:
     examples = [FewShotExample(**e) for e in json.loads((root / "few_shot.json").read_text(encoding="utf-8"))]
     devset = json.loads((root / "devset.json").read_text(encoding="utf-8"))
     config = json.loads((root / "config.json").read_text(encoding="utf-8"))
-    return Bundle(catalog, examples, devset, config)
+    return Bundle(catalog, examples, devset, config, root / "examples_pool.json.gz")
 
 
 def dev_choices(bundle: Bundle) -> list[dict]:
@@ -124,6 +136,9 @@ class RunRequest:
     model: str = "glm-4-flash"
     strategy: str = "targeted"    # targeted | generic
     verifier: str = "self"        # self | oracle (upper bound)
+    max_repairs: int = 1          # repair rounds per question; SQL attempts = max_repairs + 1
+    few_shot: str = "static"      # static (fixed examples) | dynamic (similar solved questions, agent/examples.py)
+    knowledge: bool = False       # add warehouse usage notes mined from solved queries (agent/knowledge.py)
     publish: bool = True
 
 
@@ -136,6 +151,7 @@ class LiveRun:
     run_id: str | None = None
     summary: dict | None = None
     published: dict | None = None
+    report: str | None = None      # markdown analysis report (app/report.py), set when the run finishes
     started: float = field(default_factory=time.time)
     finished: float | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -173,7 +189,7 @@ def _out_root() -> Path:
 
 
 def _execute(live: LiveRun, bundle: Bundle, connect) -> None:
-    from agent.generator import PROMPT_VERSION, FewShotGenerator
+    from agent.generator import FewShotGenerator
     from agent.llm import CachingChatClient, UsageMeter, make_client
     from agent.retriever import BM25TableRetriever
     from dbx.catalog import Layout
@@ -182,7 +198,7 @@ def _execute(live: LiveRun, bundle: Bundle, connect) -> None:
     from loop_engineer.controller import LoopConfig, LoopController
     from loop_engineer.diagnose import DIAGNOSER_VERSION, Diagnoser
     from loop_engineer.policy import Policy
-    from loop_engineer.verifier import SELF_SIGNALS, OracleVerifier, SelfVerifier
+    from loop_engineer.verifier import SELF_SIGNALS, VERIFIER_VERSION, OracleVerifier, SelfVerifier
     from skills.base import RepairContext
 
     req, cfg = live.request, bundle.config
@@ -190,28 +206,50 @@ def _execute(live: LiveRun, bundle: Bundle, connect) -> None:
     conn = connect()  # own warehouse connection per run thread
     try:
         cases, judges = _cases_and_judges(bundle, req.split, req.case_ids, conn)
-        n = len(cases)
-        meter = UsageMeter(max_calls=4 * n + 4, max_tokens=60_000 * n + 60_000)  # per-click budget
+        n, r = len(cases), req.max_repairs
+        # per-click budget: per question 1 generation + per repair round (diagnosis LLM + repair LLM)
+        calls = (1 + 2 * r) * n + 4
+        meter = UsageMeter(max_calls=calls, max_tokens=30_000 * calls)
         inner = make_client(model=req.model, max_output_tokens=int(lc["max_output_tokens"]), meter=meter)
         client = CachingChatClient(inner, _cache_path())
-        controller = LoopController(BM25TableRetriever(bundle.catalog),
-                                    FewShotGenerator(client, bundle.catalog, bundle.examples), conn,
+        fs = cfg.get("few_shot", {})
+        index = bundle.example_index() if req.few_shot == "dynamic" else None
+        if req.few_shot == "dynamic" and index is None:
+            raise FileNotFoundError("examples_pool.json missing from the app bundle; rerun scripts/build_app_bundle.py")
+        kb = None
+        if req.knowledge:
+            from agent.knowledge import load_knowledge
+            kb = load_knowledge(BUNDLE / "kb.json")
+            if kb is None:
+                raise FileNotFoundError("kb.json missing from the app bundle; run scripts/build_knowledge.py and "
+                                        "scripts/build_app_bundle.py")
+        generator = FewShotGenerator(client, bundle.catalog, bundle.examples, index=index,
+                                     k=int(fs.get("dynamic_k", 4)), max_extra_tables=int(fs.get("dynamic_max_extra_tables", 6)),
+                                     knowledge=kb)
+        controller = LoopController(BM25TableRetriever(bundle.catalog), generator, conn,
                                     Diagnoser(bundle.catalog, client), Policy(),
                                     RepairContext(bundle.catalog, client, bundle.examples),
-                                    LoopConfig(strategy=req.strategy, top_k=int(cfg["retrieval"]["top_k"]),
+                                    LoopConfig(strategy=req.strategy, max_attempts=req.max_repairs + 1,
+                                               top_k=int(cfg["retrieval"]["top_k"]),
                                                max_result_rows=int(d["max_result_rows"])))
         verifier_for = ((lambda cid: SelfVerifier()) if req.verifier == "self"
                         else (lambda cid: OracleVerifier(judges[cid])))
         arm = f"console-{req.strategy}-{req.verifier}"
         meta = {"split": req.split, "strategy": req.strategy, "verifier": req.verifier,
                 "upper_bound": req.verifier == "oracle", "policy": "targeted", "disabled": "", "source": "console",
-                "self_signals": list(SELF_SIGNALS), "model": inner.model, "provider": inner.provider,
-                "prompt_version": PROMPT_VERSION, "diagnoser": DIAGNOSER_VERSION, "max_attempts": 2,
+                "self_signals": list(SELF_SIGNALS), "verifier_version": VERIFIER_VERSION, "model": inner.model, "provider": inner.provider,
+                "prompt_version": generator.prompt_version, "few_shot": req.few_shot,
+                "knowledge": "on" if req.knowledge else "off", "diagnoser": DIAGNOSER_VERSION,
+                "max_attempts": req.max_repairs + 1, "max_repairs": req.max_repairs,
                 "case_ids": [c.case_id for c in cases]}
         run_id, summary = run_arm(cases, judges, controller, verifier_for, arm, _out_root(), meta,
                                   on_event=live.push)
         summary["llm_usage"] = meter.snapshot()
         live.run_id, live.summary = run_id, summary
+        from app.report import build_report
+        live.report = build_report(live.snapshot(), asdict(req), summary, run_id, live.elapsed)
+        (_out_root() / run_id / "report.md").write_text(live.report, encoding="utf-8")
+        live.push("", "report", {"chars": len(live.report)})
         if req.publish:
             live.push("", "publish", {"state": "running"})
             live.published = publish_run(conn, Layout(CATALOG), _out_root() / run_id, "console", None)
@@ -232,10 +270,12 @@ def _execute(live: LiveRun, bundle: Bundle, connect) -> None:
 def start_run(request: RunRequest, bundle: Bundle, connect) -> LiveRun:
     if not request.case_ids:
         raise ValueError("pick at least one question")
-    if len(request.case_ids) > MAX_CASES:
+    if MAX_CASES and len(request.case_ids) > MAX_CASES:
         raise ValueError(f"at most {MAX_CASES} questions per run")
     if request.model not in MODELS:
         raise ValueError(f"unknown model {request.model}")
+    if not 1 <= request.max_repairs <= MAX_REPAIRS:
+        raise ValueError(f"max_repairs must be 1..{MAX_REPAIRS}")
     live = LiveRun(request)
     live.push("", "queued", {"at": dt.datetime.now().strftime("%H:%M:%S"), "cases": len(request.case_ids)})
     threading.Thread(target=_execute, args=(live, bundle, connect), daemon=True, name="loop-run").start()

@@ -39,6 +39,9 @@ class RepairResult:
     output_tokens: int = 0
     latency_ms: int = 0
     parse_status: str = "OK"
+    # what the skill did internally, for live UIs / reports (agent-visible data only):
+    # deterministic_changes, unresolved, candidate_columns, join_candidates, instruction, prompt, ...
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 class RepairSkill(Protocol):
@@ -69,6 +72,10 @@ Return the corrected query as ONE read-only SQL query inside a ```sql code fence
 
 def observed_text(obs: Observation) -> str:
     if obs.execution_status == "SUCCESS":
+        found = [f.get("hint") or f.get("message") for f in obs.verifier_findings if f.get("hint") or f.get("message")]
+        if found:
+            return (f"It ran and returned {obs.result_row_count} row(s), but a check of the SQL against the question "
+                    "found:\n- " + "\n- ".join(found))
         return f"It ran and returned {obs.result_row_count} row(s); the result is believed to be wrong."
     if obs.execution_error:
         return f"Executing it failed with:\n{obs.execution_error[:1200]}"
@@ -76,7 +83,7 @@ def observed_text(obs: Observation) -> str:
 
 
 def llm_repair(skill: str, obs: Observation, diagnosis: Diagnosis, ctx: RepairContext, tables: list[str],
-               instruction: str, action: str) -> RepairResult:
+               instruction: str, action: str, details: dict[str, Any] | None = None) -> RepairResult:
     tables = [t for t in dict.fromkeys(tables) if t in ctx.catalog.tables][: ctx.max_schema_tables]
     prompt = REPAIR_TEMPLATE.format(rules=RULES, schema=render_schema(ctx.catalog, tuple(tables)),
                                     question=obs.question, sql=obs.generated_sql or "(no SQL was produced)",
@@ -86,7 +93,10 @@ def llm_repair(skill: str, obs: Observation, diagnosis: Diagnosis, ctx: RepairCo
     r = ctx.client.complete(prompt, system=SYSTEM)
     sql, status = extract_sql(r.text)
     return RepairResult(sql, skill, action, diagnosis.reason, tuple(tables), True,
-                        r.input_tokens, r.output_tokens, r.latency_ms, status)
+                        r.input_tokens, r.output_tokens, r.latency_ms, status,
+                        {**(details or {}), "instruction": instruction, "schema_tables": list(tables),
+                         "start_sql": obs.generated_sql, "prompt": prompt, "raw_response": r.text[:4000],
+                         "cached": r.cached})
 
 
 def as_hints(diagnosis: Diagnosis) -> dict[str, Any]:

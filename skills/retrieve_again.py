@@ -25,6 +25,7 @@ class RetrieveAgain:
     def repair(self, obs: Observation, diagnosis: Diagnosis, ctx: RepairContext) -> RepairResult:
         h = as_hints(diagnosis)
         used = sorted(set(alias_map(obs.generated_sql).values()) & set(ctx.catalog.tables))
+        joins: list[str] = []
         if h.get("signal") == "table_not_found":
             missing = (h.get("missing_table") or "").split(".")[-1]
             add = difflib.get_close_matches(missing.lower(), list(ctx.catalog.tables), n=4, cutoff=0.4)
@@ -39,4 +40,5 @@ class RetrieveAgain:
                            f"{'; '.join(joins) or '(none found - choose matching key columns)'}. "
                            "Check that every column the question needs comes from a table that really has it.")
             action = f"added tables {add} ({h.get('case')}) with join candidates"
-        return llm_repair(self.name, obs, diagnosis, ctx, [*used, *add, *obs.retrieved_tables], instruction, action)
+        return llm_repair(self.name, obs, diagnosis, ctx, [*used, *add, *obs.retrieved_tables], instruction, action,
+                          {"tables_added": add, "tables_in_sql": used, "join_candidates": joins})
