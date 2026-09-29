@@ -19,9 +19,9 @@
 |---|---|---|---|---|
 | 1 | 申请 BEAVER 数据访问（HuggingFace） | 你 | ✅ | 2026-09-25 |
 | 2 | 重新登录 Databricks | 你 | ✅ | 2026-09-25 |
-| 3 | 配置 `.env`（MySQL 密码、智谱 key） | 你 | ⬜ | |
-| 4 | 下载 BEAVER 数据库并导入 MySQL | 你 | ⬜ | |
-| 5 | 运行 Phase 0 并评审报告 | Claude | ⬜ | |
+| 3 | 配置 `.env`（MySQL 密码、智谱 key） | 你 | ✅ | 2026-09-25 |
+| 4 | 下载 BEAVER 数据库并导入 MySQL | 你 | ✅ | 2026-09-25 |
+| 5 | 运行 Phase 0 并评审报告 | Claude | ✅ | 2026-09-25 |
 
 ---
 
@@ -105,11 +105,11 @@
 
 | 项目 | 结果 |
 |---|---|
-| 执行日期 | |
-| `.env` 已创建（是 / 否） | |
-| MySQL 版本输出 | |
-| 智谱 key 已配置（只写长度） | |
-| 遇到的问题与处理 | |
+| 执行日期 | 2026-09-25 |
+| `.env` 已创建（是 / 否） | ✅ 是；各项值都没有引号和控制字符 |
+| MySQL 版本输出 | ✅ `8.0.25`（项目代码 `MySqlExecutor` 连接成功）。已有库 `itstack`、`wechat`、`qgydb` 都在；`lower_case_table_names=1`；`max_allowed_packet=4MB` |
+| 智谱 key 已配置（只写长度） | ✅ 长度 49；`glm-4-flash` 试调用 HTTP 200，26 tokens，约 2.8 秒 |
+| 遇到的问题与处理 | root 密码未知，已通过 Workbench 保存的连接执行 `ALTER USER` 重设（问题记录 #3）。Windows 终端 GBK 编码打印模型回复里的 emoji 报错，`scripts/phase0.py` 已改为 UTF-8 输出（问题记录 #4） |
 
 ---
 
@@ -136,16 +136,16 @@
 
 | 项目 | 结果 |
 |---|---|
-| 执行日期 | |
-| 下载是否成功（文件大小） | |
-| 解压出的 `.sql` 文件列表 | |
-| 每个文件的导入耗时 / 是否成功 | |
-| 遇到的问题与处理 | |
+| 执行日期 | 2026-09-25 |
+| 下载是否成功（文件大小） | ✅ `beaver_db.zip` 261.6 MB（由 Claude 运行 `fetch_beaver_db.py` 下载） |
+| 解压出的 `.sql` 文件列表 | `dw.sql` 92.6 MB（97 张表，153 条 INSERT）、`neutron.sql` 6.1 MB（175 张表）、`nova.sql` 2.05 GB（109 张表） |
+| 每个文件的导入耗时 / 是否成功 | ✅ 只导入了 `dw.sql`（你在 cmd 里手动执行）。验证：97 张表，共 421,707 行，单表最多 10,000 行；5 张空表（`estimated_surcharges_estonly`、`fund_center_hierarchy`、`opa_person_current`、`profit_center_group`、`subject_selector`）在 dump 里本来就没有 INSERT，属于正常。`neutron`、`nova` 暂不导入 |
+| 遇到的问题与处理 | 压缩包在 macOS 上打的，带有 `__MACOSX/`、`._*`、`.DS_Store` 垃圾文件，脚本已改为跳过（问题记录 #5）。dump 由 MySQL 9.1/9.3 导出，`dw.sql` 只用了 varchar/int/float、`utf8mb4_0900_ai_ci`、InnoDB，与本机 8.0.25 兼容；最长一行约 1 MB，小于 `max_allowed_packet`=4 MB，**不需要调大** |
 
 `SHOW DATABASES` 输出：
 
 ```
-（粘贴到这里）
+dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 ```
 
 ---
@@ -156,12 +156,12 @@
 
 | 小步骤 | 命令 | 产出 | 回答 | 状态 | 结果摘要 |
 |---|---|---|---|---|---|
-| 5.1 环境检查 | `phase0.py env` | catalog、schema、volume | 前置检查 | ⬜ | |
-| 5.2 导入题库 | `phase0.py import` | `benchmark.cases`（100 个 case） | Q1 | ⬜ | |
-| 5.3 复制数据库 | `phase0.py replicate` | Databricks 里的 BEAVER 表、逐表核对报告 | Q2 | ⬜ | |
-| 5.4 兼容性验证 | `phase0.py compat` | 每条 Gold SQL 的兼容性分类 | Q3 | ⬜ | |
-| 5.5 冻结 Gold | `phase0.py gold` | `benchmark.gold_results` | Q4、Q5 | ⬜ | |
-| 5.6 生成报告 | `phase0.py report` | `reports\phase0_report.md` | 汇总 | ⬜ | |
+| 5.1 环境检查 | `phase0.py env` | catalog、schema、volume | 前置检查 | ✅ | catalog `self_healing_text2sql` 创建成功（不需要改用 `workspace`）；4 个 schema 和 staging volume 已建；DBSQL 2026.36；`UTF8_LCASE` 可用 |
+| 5.2 导入题库 | `phase0.py import` | `benchmark.cases`（100 个 case） | Q1 | ✅ | 从 dw 全部 5,787 题中按官方种子 77 抽样 100 题：复杂查询 43、领域复杂查询 48、领域查询 9；57 题含领域知识；每题 Gold 涉及 2–6 张表。`tables_meta` 97 行；`cases_agent_view` 已建。Gold SQL 大量使用窗口函数和多层 CTE，有 `VARIANCE`（MySQL 是总体方差，Databricks 是样本方差，属于潜在语义差异） |
+| 5.3 复制数据库 | `phase0.py replicate` | Databricks 里的 BEAVER 表、逐表核对报告 | Q2 | ✅ | 97 张表全部复制，行数一致（421,707 = 421,707），无零日期。95 张表逐列核对完全一致；2 张表的"不同值个数"差 1–6 个（`course_catalog_subject_offered.SUBJECT_DESCRIPTION`、`tip_material.TITLE / AUTHOR`）。原因已确认是**重音不敏感**：MySQL `utf8mb4_0900_ai_ci` 把 `Gödel`/`Godel`、`Gérard`/`Gerard` 视为同一个值，`UTF8_LCASE` 只忽略大小写（已知限制，共涉及 8 个值）。是否影响 Gold 结果由 5.4 判定 |
+| 5.4 兼容性验证 | `phase0.py compat` | 每条 Gold SQL 的兼容性分类 | Q3 | ✅ | **第 2 次（方案 B，正式结果）** run `compat-20260925T075328-c39909`：原始 Gold SQL 不改直接执行能跑通 94/100；**结果与 MySQL 一致 46/100**（新比较规则多认出 9 条只差数字精度的）。分类：COMPATIBLE 46、INCOMPATIBLE_SEMANTICS 48、INCOMPATIBLE_FUNCTION 5、INCOMPATIBLE_SCHEMA 1、UNKNOWN 0。规则改写后结果与 MySQL 一致 **43 条**（总体方差规则 38、窗口帧规则 5；包括之前卡住的 dw_4004）。**可用 89/100**；**排除 11 条**：6 条没有适用规则（并列值排序或日期解析导致结果不唯一：dw_4876、dw_817、dw_1737、dw_4522、dw_3868、dw_2443），4 条用了方差规则但结果仍不同（改写后仍受窗口并列值影响：dw_1616、dw_2394、dw_232、dw_4339），1 条 `UNION` 排序规则冲突（dw_1795）。<br>**第 1 次（严格版，已归档为 `runs/phase0/03_compatibility_run1_strict.json`）** run `compat-20260925T062933-a95884`。**不改一个字直接执行：能执行 94/100，结果与 MySQL 一致 37/100。** 分类：COMPATIBLE 37、INCOMPATIBLE_SEMANTICS 57、UNKNOWN 6；两边结果各自重复执行都稳定。sqlglot 自动改写：0 条通过（47 条结果仍不同，16 条执行失败）。**57 条结果不同的原因（逐条复查）：** ① 37 条：MySQL 的 `VARIANCE/STD/STDDEV` 是**总体**统计量，Databricks 的同名函数是**样本**统计量；② 9 条：只是数字精度不同（MySQL `AVG`/除法只保留 4 位小数）；③ 11 条：窗口函数或 `LIMIT` 的排序键有并列值，并列行的先后顺序两个引擎处理不同（Gold 本身有歧义），另有日期解析差异等。**6 条 UNKNOWN：** 5 条是排名函数带了 `ROWS` 窗口帧（MySQL 忽略帧，Databricks 报错），1 条是 `UNION` 两边排序规则冲突（`UTF8_LCASE` 与普通 STRING），是我们环境设置带来的 |
+| 5.5 冻结 Gold | `phase0.py gold` | `benchmark.gold_results` | Q4、Q5 | ✅ | run `gold-20260925T080708-5ee3bd`（基于 `compat-20260925T075328-c39909`），用新的数据库连接每条执行 3 次：**PRIMARY 89**（原始 Gold SQL 46 + 规则改写 43）、EXCLUDED 11；**漂移 0**；没有空结果；结果行数中位数 35，最多 130,080 |
+| 5.6 生成报告 | `phase0.py report` | `reports\phase0_report.md` | 汇总 | ✅ | 判定为**方案 B**。Q2 改为三档判定（yes / partial / no）；Q5 分开列出原始 SQL 和改写 SQL 的数量 |
 
 完整命令格式（把 `env` 换成对应步骤名）：
 
@@ -173,16 +173,27 @@
 
 | 问题 | 答案 |
 |---|---|
-| Q1 BEAVER Dataset 是否成功进入 Databricks？ | |
-| Q2 BEAVER Schema 是否能在 Databricks 中正确还原？ | |
-| Q3 多少 Gold SQL 可以直接在 Databricks 执行？ | |
-| Q4 Gold SQL 的执行结果是否稳定？ | |
-| Q5 能否在不修改 Ground Truth 的情况下完成 Evaluation？ | |
-| **方案判定（A / B / C）** | |
-| 可用于主评测（PRIMARY）的 case 数 | |
-| 是否进入 Phase 1 | |
+| Q1 BEAVER Dataset 是否成功进入 Databricks？ | ✅ **是**。100 个 case（dw，官方种子 77 抽样）写入 `benchmark.cases`，原始 Gold SQL 带指纹保存、拒绝覆盖；97 张表的结构信息写入 `tables_meta`；Agent 只能通过 `cases_agent_view` 读到 case_id / question / db |
+| Q2 BEAVER Schema 是否能在 Databricks 中正确还原？ | 🟡 **基本还原（partial）**。97/97 张表、421,707 行全部一致；95 张表逐列核对一致；2 张表的 3 个列（`course_catalog_subject_offered.SUBJECT_DESCRIPTION`、`tip_material.TITLE/AUTHOR`）有 8 个值因重音不敏感排序规则不同而去重结果不同（`UTF8_LCASE` 不忽略重音）。**100 个 case 的 Gold SQL 都没有用到这 3 个列，不影响评测** |
+| Q3 多少 Gold SQL 可以直接在 Databricks 执行？ | 不改直接执行能跑通 **94/100**；结果与 MySQL 一致 **46/100**。另有 43 条经两条有文档依据的规则改写后结果一致，共 **89/100 可用** |
+| Q4 Gold SQL 的执行结果是否稳定？ | ✅ **是**。同一次运行中两个引擎各执行 3 次，结果都一致；换新连接重新执行，89 条漂移为 0 |
+| Q5 能否在不修改 Ground Truth 的情况下完成 Evaluation？ | ✅ **是**。`benchmark.cases` 里的 Gold SQL 保持原文；改写只存在 `gold_adaptations` 里，并附规则名、文档链接和结果验证；89 条的冻结答案都经过和 MySQL 官方引擎的结果比对 |
+| **方案判定（A / B / C）** | **B**：部分 SQL 经过有文档依据、逐条验证的规则适配；11 条排除并计数 |
+| 可用于主评测（PRIMARY）的 case 数 | **89**（原始 46 + 改写 43）；排除 11 |
+| 是否进入 Phase 1 | ✅ 关卡一通过（89 ≥ 50），待你确认后进入 Phase 1 |
 
 ---
+
+## 决策记录
+
+| # | 日期 | 决策 | 理由 |
+|---|---|---|---|
+| D1 | 2026-09-25 | **Phase 0 采用方案 B（规则化适配）**：① 跨引擎比较按 DECIMAL 自身的小数位比较，浮点数相对误差 1e-6；② 改写规则只有两条，都有 MySQL 官方文档依据：`VARIANCE/STD/STDDEV` → `VAR_POP/STDDEV_POP`，删除排名类窗口函数上被 MySQL 忽略的窗口帧；③ 改写后的 SQL 必须跑出与 MySQL 一致的结果才算通过，通过的进入主评测（PRIMARY）；④ 结果依赖并列值排序的 Gold 直接排除并计数。sqlglot 自动改写弃用 | 严格方案只有约 46 个可用 case，达不到关卡一要求的 50；方案 B 每条改写都有文档依据，并且逐条做了结果验证 |
+| D2 | 2026-09-25 | **① prompt 升级为 `baseline-v2`**：规则 4 改为明确的 MySQL→Databricks 统计函数对照（题干写 STDDEV/VARIANCE 或 "never STDDEV_POP" 时，一律写 `STDDEV_POP`/`VAR_POP`）。**② 建立开发集**：从评测集以外的 dw 题中固定抽 30 题（排除 few-shot 示例，种子 20260926），Gold 结果在 MySQL 上实时计算，只保留改写后在 Databricks 上能复现的题；从此 prompt、模型和参数的迭代只在开发集上做，89 道评测题只在配置冻结后跑一次 | ① 26/89 道评测题（dw 全集 2,116/5,787）题干带 MySQL 函数名，v1 规则和这些题干冲突，照题干写必然判错。这是基于全局事实的环境说明，不含 Gold 信息。② 1.6 试点是在评测题上做的，继续在上面改 prompt 就等于在考题上调参 |
+| D3 | 2026-09-25 | **方案 A：保持 `glm-4-flash`，冻结 baseline 配置**（prompt `baseline-v2`、k=20、3 个 few-shot 示例），在 89 道评测题上跑一次正式 baseline，然后进入 Phase 2–6 搭 Inner Loop；**整个流程跑通后再换模型**，用同一套流程重跑对比 | 先让端到端流程跑起来。失败的结构清楚（20/21 个列报错是列挂错了表），Loop 有足够的可修素材。已知限制：首次准确率接近 0 时，Harm Rate 基本无法测量，换模型后补测 |
+| D4 | 2026-09-25 | **维持 D3**：干预实验证明 glm-4-flash 在 5 类 Gold 提示全部给出时也修不好（0/30），但仍继续用它搭完 Phase 4–6，最后再换模型。Phase 3 标签：以确定性标注器（第一轮抽检一致率严格 75% / 宽松 90%）作为 Diagnosis Accuracy 的参照，因为干预实验在这个模型上给不出结论；换模型后重跑干预实验来校准 | 优先把 Loop 的工程结构和评测体系跑通。**已知后果**：这一轮 Loop 的恢复率可预判接近 0，实验数据只用来验证流程，不作为结论；换模型后用同一套流程重跑 |
+| D5 | 2026-09-25 | **不做 Phase 7（评测集对照实验）和 Phase 8（消融实验）**，当前重点改为优化现有代码 | 经与其他人讨论后决定。Loop 的工程结构已经跑通；Console 里 Phase 7 / 8 的预留区保留（代码已支持，以后需要时直接运行即可） |
+| D6 | 2026-09-28 | **默认模型保持 glm-4-flash**；DeepSeek 接入代码保留，`deepseek-flash`（关闭思考）作为备用，用户通知后再切换 | 探测显示 deepseek-flash 给全部 Gold 提示能修好 7/27（glm 0/30），适合展示 Loop 效果；但当前阶段重点是用免费模型修复代码、梳理流程，暂不产生费用。探测数据见本文件“换模型探测 · DeepSeek”一节 |
 
 ## 问题记录
 
@@ -192,10 +203,204 @@
 |---|---|---|---|---|---|
 | 1 | 2026-09-25 | 1.5 | `hf auth login` 选浏览器登录后，终端一直显示 `Waiting for authorization....` | 设备授权流程：终端在等浏览器那边完成授权，不会自动跳转 | 浏览器打开 https://hf.co/oauth/device ，登录后输入终端显示的代码（如 `XXXX-XXXX`）并授权；代码过期就 `Ctrl+C` 重新运行。网络不通时改用"粘贴 token"方式登录 |
 | 2 | 2026-09-25 | 2.2 | `databricks auth login` 提示 `Databricks profile name [dbc-2beb6eae-4266]:` | 新版 CLI 默认用工作区名作为 profile 名，项目配置读取的是 `DEFAULT` | 输入 `DEFAULT` 回车（覆盖旧 profile）；或者保留默认名，再把 `config/phase0.yaml` 的 `profile` 改成同名 |
-| 3 | | | | | |
+| 3 | 2026-09-25 | 3.2 | 不记得安装过 MySQL，不知道 root 密码 | 本机在 2021-06-05 用官方安装程序装过 MySQL 8.0.25（服务 `MySQL80`，端口 3306，已有库 `itstack`、`wechat`、`qgydb`） | 先试 Workbench 里保存的连接；不行就用官方的 `--init-file` 方法重置 root 密码（不影响已有数据），完成后删除含明文密码的 init 文件。**学员指南需要补充"安装 MySQL"这一步** |
+| 4 | 2026-09-25 | 3 | 试调用智谱时 `UnicodeEncodeError: 'gbk' codec can't encode character '\U0001f44b'` | Windows 终端默认 GBK 编码，打印不了模型回复里的 emoji（调用本身是成功的） | `scripts/phase0.py` 启动时把 stdout/stderr 改为 UTF-8；其他脚本可设置环境变量 `PYTHONIOENCODING=utf-8` |
+| 5 | 2026-09-25 | 4.1 | 脚本列出了 `__MACOSX\beaver_db\._dw.sql` 等 6 个"dump" | 压缩包在 macOS 上生成，带资源分叉垃圾文件 | `fetch_beaver_db.py` 解压时跳过 `__MACOSX/`、`._*`、`.DS_Store`；已删除之前解压出的垃圾文件 |
+| 6 | 2026-09-25 | 5.4 | 按方案 B 重跑时停在 88/100，日志约 20 分钟没有更新；MySQL 和 Databricks 上都没有正在执行的查询 | 第 89 个 case（dw_4004）返回 15,881 行，结果不一致时比较代码逐行两两比较（O(n²)，约 2.5 亿次），CPU 一直在算 | 大分组改成先排序、再逐行对齐（O(n log n)），16k 行约 0.5–1.5 秒；停掉原进程后从头重跑 |
+| 7 | 2026-09-25 | 5.4 | `03_compatibility.json` 里的 `adaptations` 变成了改写明细列表，汇总统计丢失 | 保存本地文件时，明细和汇总用了同一个键名，明细覆盖了汇总（Delta 表不受影响） | 明细改存为 `adaptation_records`；已按原数据修复本次运行的 JSON 文件 |
+| 8 | 2026-09-25 | 5.6b / 6 | dw_4188：SchemaSearch v2 确定性修复后 SQL 能执行，但返回 0 行；修复后的关联条件变成了 `sd.DEPARTMENT_CODE = sd.DEPARTMENT_CODE`、`ata.ACADEMIC_YEAR = ata.ACADEMIC_YEAR` | 错误的列引用正好在 JOIN ON 条件里，按"改到同一作用域里唯一拥有该列的表"修改后，它和等号另一侧变成了同一张表，关联条件恒为真，表之间失去关联（学期表和院系表本来就没有直接的关联键）。Phase 5 评测把它算成"报错 → 可执行"，统计虚高 | `fix_column_refs` 改完后检查所有"列 比较 列"的条件，改完后两边是同一个别名的就撤销，标记为"需要真正的关联键"，连同 schema 推断的候选关联键一起交给 LLM。补了 2 个回归测试。v2 结果归档为 `runs/phase5/repair-targeted-v2-tautology-bug.json`，Phase 6 的旧运行移到 `runs/phase6/_superseded/`，全部重跑 |
+| 9 | | | | | |
 
 ---
 
-## 后续 Phase
+## Phase 1 · Few-shot Baseline
 
-Phase 0 通过后，在这里追加 Phase 1 的执行记录（步骤见 [ROADMAP.md](ROADMAP.md) 第三节）。
+分支 `phase1-baseline`。步骤见 [ROADMAP.md](ROADMAP.md) 第三节。配置：[config/phase1.yaml](../config/phase1.yaml)。
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| 1.1 | LLM 客户端 `agent/llm.py` | ✅ | 智谱 OpenAI 兼容接口，`do_sample=False`；408/429/5xx 退避重试；key 控制字符检查；调用次数和 token 预算上限；按 (模型, 参数, system, prompt) 指纹的本地缓存 |
+| 1.2 | 表检索 `agent/retriever.py` | ✅ | BM25（表名 ×3、列名 ×2、示例值 ×1）。schema 用 Databricks 实际列类型（beaver-table 里是 Oracle 类型 `VARCHAR2`）加示例取值。**k 在 300 道非评测题上调参**（`random.Random(20260925)`）：k=10 召回 0.73，k=15 0.84，**k=20 0.91（67% 的题能拿全 Gold 表）**，k=25 0.94，k=30 0.95，取拐点 k=20 |
+| 1.3 | 生成器 `agent/generator.py` | ✅ | prompt 版本 `baseline-v1`：规则 + schema + 3 个 few-shot 示例 + 问题。示例取自评测集之外的 dw 题（≤3 张表、≤900 字符，套用 Phase 0 改写规则后能按 Databricks 语法解析） |
+| 1.4 | 执行器 | ✅ | 复用 `execution/databricks_sql.py`，新增结果行数上限（50 万行，超出记为 `TOO_MANY_ROWS`） |
+| 1.5 | 评测 `evaluation/baseline.py` | ✅ | 生成结果先统一格式，再和冻结的 Gold 按 BEAVER 官方规则比较（`evaluate_against_gold`）；表召回率只作为评估诊断，不交给 Agent。测试共 71 个，全部通过 |
+| 1.5b | 冒烟测试（2 题） | ✅ | 链路跑通。2 题都执行报错，是模型错误：编造了不存在的表 `FAC_BUILDING` 和列 `COURSE_LEVEL`，并且没按规则用了 `STDDEV`。每次调用约 1.4 万 token、26 秒 |
+| 1.6 | 小样本试点（20 题） | ⏸ 待决策 | run `baseline-20260925T082731-3b1b4d`（prompt `baseline-v1`，glm-4-flash，k=20）：**0/20 答对**；能执行 9/20（11 题 `UNRESOLVED_COLUMN`，模型编造列名）；能执行的 9 题中 7 题数值不对、1 题列数不对、1 题返回空。平均表召回 0.85，Gold 表全部选到的 11 题也是 0 题答对，**瓶颈在生成**。每题约 1.38 万 token，中位耗时 14.7 秒。**发现方言冲突：** 89 道主评测题中 26 题（dw 全集 5,787 题中 2,116 题）题干写着 "using STDDEV only and never STDDEV_POP"。这是 MySQL 语义（MySQL `STDDEV` = 总体），在 Databricks 照原文写就是样本标准差，必然判错；prompt 规则 4 又要求用 `STDDEV_POP`，两者冲突。已人工核对评测代码无误 |
+| 1.6b | 开发集 + prompt v2 | ✅ 决策 D3 | **开发集**：看了 34 道候选题入选 30 题（淘汰 4 题：3 题在 Databricks 上无法复现，1 题报错）；领域复杂查询 17、复杂查询 7、领域查询 6。**baseline-v2**（run `baseline-20260925T084206-51d855`，glm-4-flash）：**0/30 答对**；能执行 4/30；报错 26 题（`UNRESOLVED_COLUMN` 21、`TABLE_OR_VIEW_NOT_FOUND` 2、语法错误 2、其他 1）；表召回 0.92，Gold 表全部选到的 22 题也是 0 题答对；仍有 3 题用了样本统计函数。**21 个列报错中有 20 个，这一列其实存在于另一张已选出的表里**，是把列挂错了表别名，并非凭空编造，Inner Loop 的 `SchemaSearch` 可以用查表方式修复。待决策：是否先用更强的智谱模型在开发集上探测一次 |
+| 1.7 | 正式 Baseline（89 题） | ✅ | run `baseline-20260925T085517-69b4ac`（配置 `baseline-v2` / glm-4-flash / k=20，只跑一次）：**首次准确率 2/89 = 2.25%**（dw_461、dw_104，都是领域复杂查询）；可执行 21/89 = 23.6%；执行报错 68 题（`UNRESOLVED_COLUMN` 58、表不存在 3、语法错误 3、其他 4）；能执行的 21 题中 14 题数值不对、4 题返回空、1 题列数不对、2 题答对。表召回 0.887（按标注计算，偏保守）；Gold 表全部选到的 58 题中答对 1 题，有缺表的 31 题中答对 1 题。共 89 次 LLM 调用、122 万 token（平均 1.37 万/题），中位耗时 16.5 秒。已发布到 Delta 和 MLflow（MLflow run `e062ead6e8634f2e845b46239fb48a21`）；v1 试点那次也已补发 |
+
+## Phase 2 · Trace / 可观测性
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| 2.1 | Delta 表 | ✅ | `traces.execution_traces`：每次尝试一行，已预留 Verifier / 诊断 / 修复字段，供 Phase 4–6 填写。`evaluation.evaluation_results`：判分结果（correct、表召回等）。`evaluation.runs`：运行汇总。**边界：用 Gold 算出来的字段只放 evaluation.\*，trace 里没有**，因为自检模式下的 Observer / Diagnoser 会读 trace（有测试保证） |
+| 2.2 | MLflow | ✅ | 实验 `/Users/mushan.ysl@gmail.com/self_healing_text2sql`（id 1654657461219271）。每次运行记录参数（模型、prompt 版本、k、few-shot 示例 id）、指标（准确率、可执行率、表召回、token、延迟）和产出文件（summary / run_meta / results） |
+| 2.3 | 发布脚本 | ✅ | `scripts/publish_run.py <run_dir>`：同一个 run_id 重复发布时，先删旧行再写，MLflow 按 run_id 标签复用，保证幂等。已发布开发集运行 `baseline-20260925T084206-51d855`（30 条 trace）。生成记录新增 `result_preview`（结果前 5 行），这是 Agent 自己能观察到的执行结果，不含 Gold |
+| 2.4 | 测试 | ✅ | 全部测试共 77 个，通过 |
+
+## Phase 3 · Failure Taxonomy（失败分类，仅用于评测）
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| 3.1 | 确定性标注器 `benchmark/beaver/subtasks.py` | ✅ | 把生成的 SQL 解析成语法树（别名还原为真实表名），提取表 / 列 / 关联等式 / 常量 / 运算，和 Gold 参照逐项比较。**参照 = BEAVER 标注 ∩ Gold SQL 实际用到的内容**：dw 中 1,060/5,787 题（18%）的 `tables` 标注列了 Gold SQL 没用到的表（开发集 10/30，评测样本 15/100），领域知识标注也有类似情况。自检：Gold SQL 对照自身，开发集 30/30、评测样本 100/100 没有任何误报。测试 9 个 |
+| 3.1b | 正式 baseline 的失败标签 | ✅ | 87 个失败。**主因（按优先级取最上游）**：选表 76、列映射 7、关联键 1、领域知识 1、执行 2。**所有未通过的检查（多标签）**：选表 76、执行 68、查询拆解 40、列映射 38、领域知识 30、关联键 21。缺失的 Gold 表：**已检索但没用上 132**，没检索到 32。已发布到 `evaluation.failure_labels` |
+| 3.2 | 人工抽检 | 🔄 Claude 第一轮完成，等待人工复核 | 20 题（`spotcheck.md`）：agree 15、partial 3、disagree 2 → **一致率严格 75%，宽松 90%**。发现的系统性问题：① 领域知识误报：模型用等价的编号写法（`DEPARTMENT_CODE='18'` ≈ 'Mathematics'）时仍判为缺失，只影响多标签；② 查询拆解检查只比运算类型，既有误报（`HAVING COUNT>0` 这种无实际作用的条件）也有漏报（整个子问题没做）；③ 根因和直接报错原因会不同（选表 vs 列名 / 语法），建议单独记录直接报错原因；④ 选表偏差有时源自 Gold 自身的写法 |
+| 3.3 | 干预实验（开发集 30 道失败题） | ✅ | 结果目录 `runs/phase3/intervention-baseline-20260925T084206-51d855/`。每题分别只补一类 Gold 提示（setting=1/2 的做法，只用于离线分析），另有一个 5 类全补的上界。**单独补一类能修好：表 0/30、列 0/30、关联键 0/30、领域知识 1/21、查询拆解 1/20；5 类全补 0/30**（全补后仍有 18/30 执行报错）。因果类型：UNRESOLVED 28、领域知识 1、查询拆解 1。161 次调用，222 万 token。**结论：glm-4-flash 的瓶颈在模型能力，不在信息**。Gold 级别的信息全部给出也修不好，所以① 干预实验在这个模型上无法校准标签；② 以补充信息为主的 Inner Loop 在这个模型上恢复率可预判接近 0。决策 D3 预见的风险被数据证实 → 待决策：是否提前换模型 |
+
+## Phase 4 · Diagnosis（诊断，运行时，不接触 Gold）
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| 4.1 | Observer `loop_engineer/observer.py` | ✅ | 按**白名单**从 trace 取字段（问题、检索到的表、SQL、执行状态 / 报错 / 结果预览），correct、eval_\*、Gold 字段都进不来（有测试保证）。同时从报错文本解析出信号：错误类别、无法解析的列及其别名、Databricks 给出的列名建议、不存在的表 |
+| 4.2 | Diagnoser `loop_engineer/diagnose.py`（`diagnoser-v1`） | ✅ | **规则级**：报错某列无法解析时，到 schema 里查这一列属于哪张表 → 在 SQL 已用的表里 = 列映射（别名挂错）；在已检索但没用上的表里 = 选表（表没用上）；只在未检索到的表里 = 选表（检索遗漏）；哪里都没有 = 列映射（编造列名）。表不存在 → 选表；语法 / 聚合 / 窗口等报错 → 执行；结果行数超限 → 关联键。**LLM 级**：只在没有明确报错信号时调用（SQL 能执行但结果可疑），要求输出严格 JSON。同时输出**修复线索**（repair_hints）供 Phase 5 使用。结果共享 `agent/sql_analysis.py`（从 Phase 3 标注器中拆出的中性模块）。测试 10 个 |
+| 4.3 | 诊断准确率 `evaluation/diagnosis_eval.py` | ✅ | 严格口径 = 诊断结果等于标签主因；宽松口径 = 诊断结果在所有未通过的检查里。**开发集（30）**：严格 53.3%、宽松 56.7%；规则级 26 题：严格 61.5% / 宽松 65.4%；LLM 级 0/4。**评测集（87，冻结后只跑一次）**：**严格 40.2%、宽松 66.7%**；规则级 68 题：严格 51.5% / **宽松 76.5%**；LLM 级 19 题：严格 0/19、宽松 6/19。最大的混淆是"选表 → 列映射"（31 题）：诊断只看到直接报错（列挂错了别名），标注器看的是整体结构（还少用了表），即根因和直接原因不一致。LLM 级在 glm-4-flash 上基本无效，而且答错时置信度更高（0.84 vs 0.82）。已发布到 `traces.diagnoses`（Agent 侧）和 `evaluation.diagnosis_eval`（评测侧） |
+
+## Phase 5 · Repair Skills + Policy
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| 5.1 | Policy `loop_engineer/policy.py` | ✅ | 诊断到技能的映射写成配置：选表 → RetrieveAgain，列映射 → SchemaSearch，关联键 → FindJoinPath，查询拆解 → ReplanQuery，执行错误 / 未知 → RepairSQL；领域知识**临时**走 ReplanQuery（记为 fallback）。支持 `generic`（全部走 RepairSQL）和逐个禁用技能，供 Phase 8 消融 |
+| 5.2 | 修复技能 `skills/*.py` | ✅ | SchemaSearch：别名挂错时**确定性**改写语法树（不调用 LLM），编造列名时把引擎建议和相似列名交给 LLM；RetrieveAgain：补上拥有该列的表，并附上从 schema 推断的关联条件；FindJoinPath：列出共享键列，让 LLM 核对关联条件；ReplanQuery：拆成子问题 / CTE；RepairSQL：带报错信息做最小修改，附 Databricks 语法限制说明 |
+| 5.3 | 关联信息来源 | ✅ | `agent/join_graph.py`：只从 schema 推断（同名的 `*_CODE / *_KEY / *_ID` 键列），不用 BEAVER join_keys |
+| 5.4 | 领域知识来源 | ⏸ | RetrieveKnowledge 未实现，等待确定不属于 Gold 的知识来源（值定位 / 非评测题整理出的术语表） |
+| 5.5 | 测试 | ✅ | 新增 16 个，共 114 个。包括"skills / policy / diagnose / observer 不 import benchmark 或 evaluation 模块" |
+| 5.6 | 技能评测（开发集 30 个失败） | ✅ | 结果 `runs/phase5/repair-targeted-*.json`：**可执行 4 → 8，答对 0**。RetrieveAgain 14 题（报错 → 可执行 3/14）、SchemaSearch 11 题（2/9，其中 6 题确定性修复）、RepairSQL 3 题（0/3）、ReplanQuery 2 题（原本就能执行）。28 次 LLM 调用、33 万 token。**发现**：确定性改别名修好第一处错误后，同一条 SQL 常在下一处列引用再报错 → 需要一次修完所有能查到的列引用 |
+| 5.6b | SchemaSearch v2：一次修完所有能确定的列引用 | ✅ | `fix_column_refs` 按作用域检查每个带别名的列引用，列不在别名对应的表里、但同一作用域只有一张表有它时，改到那张表的别名；有歧义或找不到归属的，连同已修好一部分的 SQL 一起交给 LLM。**开发集可执行 8 → 10**；SchemaSearch 报错 → 可执行 2/9 → 4/9（dw_4188 一次确定性改了 3 处，不调用 LLM 就能执行）；LLM 调用 5 → 9（修不完的部分不再被丢下）；答对仍为 0。v1 结果归档为 `runs/phase5/repair-targeted-v1-single-fix.json`。测试 117 个 |
+| 5.6c | 修复问题 #8 后重跑（v3） | ✅ | 可执行 **4 → 8**（v2 有 bug 时是 10，其中 2 题的"可执行"是关联条件被改成恒真造成的，属于虚高）；SchemaSearch 报错 → 可执行 2/9；答对 0 |
+| 5.7 | 可视化报告 | ✅ | Phase 0–5 静态报告（含开发集 30 题逐题追踪、修复前后 SQL 对比）：https://claude.ai/artifact/GPw7xVDTVXBn3gidBHg2hr （私有；本地文件 `reports/loop_report.html`） |
+
+## Phase 6 · Loop Controller + Verifier + Generic Retry
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| 6.1 | Verifier `loop_engineer/verifier.py` | ✅ | **SelfVerifier**（主实验，不接触 Gold）：没生成 SQL、执行报错、结果行数超限、结果为空、某列全是 NULL。**OracleVerifier**（上界）：和 Gold 结果比对，结果一律标注为上界 |
+| 6.2 | Controller `loop_engineer/controller.py` | ✅ | 生成 → 执行 → 验证 →（不通过时）观察 → 诊断 → Policy → 修复 → 执行 → 验证，最多 2 次尝试。**targeted** 与 **generic**（Generic Retry：只把上一次的 SQL 和观察结果交回模型，要求"改正"，不诊断，不给额外 schema 信息）共用同一套控制逻辑。第 1 次尝试各组完全相同（命中 LLM 缓存）。预算按尝试次数计，诊断的 LLM 调用计入成本。最终答案：最后一次通过验证的 > 最后一次能执行的 > 最后一次 |
+| 6.3 | 指标 `evaluation/loop_run.py` | ✅ | 首次 / 最终准确率、恢复率、误伤率、净收益、平均尝试次数、额外 token、每净恢复一题的 token、Verifier 混淆矩阵（命中 / 误报 / 漏报）、各技能的恢复情况 |
+| 6.4 | 发布 | ✅ | `publish_run.py` 支持 Loop 运行：每次尝试一行 trace（含 Verifier、诊断、修复字段），评测表按尝试记录对错；MLflow 记录实验组参数和 Loop 指标。评测集运行必须显式加 `--eval` |
+| 6.5 | 开发集 4 个实验组（修复问题 #8 之后） | ✅ | 见下表。已发布到 Delta 和 MLflow。**4 组恢复都是 0**（开发集首次准确率 0/30，所以误伤率测不出；这是 D4 的已知后果） |
+
+| 实验组（开发集 30 题） | 可执行（第 1 次 → 最终） | 平均尝试 | 额外 token | Verifier：命中 / 漏报 / 误报 | 恢复 |
+|---|---|---|---|---|---|
+| Targeted Loop + Self | 4 → **9** | 1.9 | 36.96 万 | 27 / 3 / 0 | 0 |
+| Generic Retry + Self | 4 → 6 | 1.9 | 36.20 万 | 27 / 3 / 0 | 0 |
+| Targeted Loop + Oracle（上界） | 4 → **9** | 2.0 | 41.20 万 | 30 / 0 / 0 | 0 |
+| Generic Retry + Oracle（上界） | 4 → 6 | 2.0 | 40.17 万 | 30 / 0 / 0 | 0 |
+
+**解读**：token 成本相近时，Targeted Loop 让更多 SQL 变得可执行（9 vs 6），这是工程层面的差异；但 glm-4-flash 生成的 SQL 即使能执行，结果也不对，所以恢复都是 0，与干预实验的结论一致。SelfVerifier 在开发集上漏报 3 题（能执行但答错），Oracle 会把这 3 题也送去修复，但同样修不好。
+
+## Phase 9 · Loop Debug Console（先于 Phase 7 / 8 实现）
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| 9.1 | 数据层 `app/data.py` | ✅ | 直接读取 Delta 表（evaluation.runs、traces.execution_traces、evaluation.evaluation_results、failure_labels、diagnoses、diagnosis_eval、benchmark.*），不读本地文件，新运行发布后自动出现。本地通过 profile 认证；在 Databricks Apps 中使用 App 自己的凭据加上 `DATABRICKS_WAREHOUSE_ID` |
+| 9.2 | 面板 `app/dashboard.py`（Streamlit） | ✅ 本地可用 | 5 个页签：**总览**（阶段状态、关键指标、全部运行）；**对照实验**（Phase 6 开发集 4 组的表格和图表 + **Phase 7 评测集预留区**）；**消融实验**（**Phase 8 预留表**，已列出 7 个计划消融组，结果发布后自动从"未运行"变为"已运行"）；**逐题追踪**（按运行和题目查看每次尝试的 SQL、执行结果、Verifier、诊断、修复技能、前后 SQL 对比，Gold 判分单独标注"Loop 不可见"）；**失败与诊断**（标注器主因与运行时诊断的分布、诊断准确率、按来源的准确率、混淆表）。启动：`streamlit run app/dashboard.py`，或用预览配置 `loop-console`（端口 8502） |
+| 9.3 | 验证 | ✅ | 本地预览 5 个页签都能渲染，没有报错。修复了两个问题：数据库空值读成 NaN 后被当作"真"（逐题追踪页报错），以及图表颜色映射和高度 |
+| 9.4 | 「运行 Loop」页面（点击执行、trace 实时刷新） | ✅ | `LoopController.run` / `run_arm` 新增可选 `on_event` 回调，逐步发出 retrieve / generate / execute / verify / diagnose / route / repair / final 事件（只通知、不改逻辑，回调出错也不影响 Loop；新增 2 个测试）。`app/runner.py` 在后台线程里走与 `scripts/phase6.py` 相同的代码路径；`app/app_pages/run_loop.py` 每秒刷新时间线，每题结束后才显示 Gold 判分（标注 Loop 不可见）。可选开发集题目（每次最多 5 题）、模型（glm-4-flash / deepseek-flash）、策略、Verifier；评测集默认锁定（D2，`SHT_ALLOW_EVAL=1` 解锁）。运行页发起的运行标记 `source=console`，只进入「逐题追踪」，不影响 Phase 6/7 对照表。本地实测 dw_5478：46 秒走完 2 次尝试，trace 逐步出现，发布到 Delta 成功 |
+| 9.5 | 部署为 Databricks App | ✅ | `python scripts/build_app_bundle.py` 生成 `app/bundle/`（schema、few-shot、开发集、LLM 缓存；含 BEAVER 内容，已 gitignore，只上传到自己的工作区）；`python scripts/deploy_app.py` 完成 secret scope（两个 key 只存 secret，不打印）、上传 59 个文件、创建 App（SQL warehouse + secret 资源）、给 App 服务主体授予项目 catalog 权限、部署。App `self-healing-text2sql` 部署成功：https://self-healing-text2sql-7474651013274104.aws.databricksapps.com（需 Databricks 登录）。Free Edition 在已有 gmv-rca-assistant（已停止）的情况下仍能创建第 2 个 App |
+| 9.6 | 执行过程细化 + 分析报告 | ✅ | 时间线新增「观察」一步（Observer 白名单字段和从报错解析出的信号），检索显示 BM25 分数，生成显示 prompt 构成和完整 prompt，执行显示实际 SQL 和耗时；修复展示技能内部过程：`RepairResult.details` 记录确定性修改、规则无法决定的部分（如 join 守卫拦下的引用）、候选列、推断的关联键、给 LLM 的定向指令、完整修复 prompt 和修复前后 SQL diff（只含 Agent 可见信息）。运行结束后 `app/report.py` 不调用 LLM、直接由事件生成 Markdown 分析报告（总体结果、逐题结局、各环节表现、时间与成本、基于规则的发现与建议、逐题详情），页面可下载，同时保存为运行目录下的 `report.md`。本地实测 dw_4188 + dw_5478（glm-4-flash，全部缓存重放）：报告正确指出 dw_4188 修复后同样报错、dw_5478 能执行但答错（Verifier 漏报）。测试 142 个通过；已重新部署 |
+| 9.7 | 指标对比图 + 可设置最大修复次数 | ✅ | 运行页新增「最大修复次数」（1–4 次，SQL 尝试 = 修复次数 + 1，Verifier 通过即提前停止；每次点击的调用预算按轮次放大）；`scripts/phase6.py` 同步支持 `--max-repairs`。报告与图表不再假设只有 2 次尝试：`app/report.py` 按轮次记录观察 / 诊断 / 修复，并提供图表数据函数 `first_final` / `attempt_progress` / `status_grid`（有单元测试）。报告页顶部三张图（Altair）：修复前后对比柱状图（可执行 / Verifier 通过 / 答对，首次 vs 最终）、逐次尝试指标折线图（第 k 次 = 最多允许 k 次尝试时的题数，端点直接标注、形状和虚线区分重合线）、逐题 × 逐次状态格子图（报错 / 能执行但错 / 答对，★ 标出最终答案，格内有文字标签）。颜色用经过校验的分类色前 3 个槽位（浅 / 深色各一套）和固定状态色。本地实测 dw_4188 + dw_5478、最多修复 2 次：dw_4188 3 次尝试均报错，dw_5478 第 2 次通过 Verifier 提前停止；报告自动得出「第 2 次之后的修复轮次没有带来新的可执行题」。测试 143 个通过；已重新部署 |
+| 9.8 | 不限题数 + 「自检通过」措辞 | ✅ | 取消每次最多 5 题的限制（`SHT_MAX_CASES_PER_RUN=0` 表示不限），新增「选择全部 30 题」；为避免多题时每秒刷新过重，已完成的题汇总成一张表（结局、各次尝试、最终自检、Gold 判分、漏报、修复、token、耗时），完整时间线通过下拉框选看，只有正在跑的题完整展示。**PASS 的含义**：Verifier 的 PASS 是自检结论（没发现报错、空结果等明显问题），Loop 运行时看不到 Gold，不能也不应该知道答案对错；判定逻辑不变，全部界面、报告、图表和 Console 逐题追踪改称「自检通过 / 自检未通过」，自检通过但 Gold 判错的题醒目标注为「Verifier 漏报」，报告逐题表新增「漏报」列。本地实测 3 题：dw_5478、dw_5367 被标为漏报。减少漏报要靠补强 Verifier（下一步）。测试 143 个通过；已重新部署 |
+
+## 换模型探测 · DeepSeek（开发集，2026-09-28）
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| M.1 | 客户端支持多厂商 | ✅ | `agent/llm.py` 改为一个 OpenAI 兼容客户端 + 厂商配置（`zhipu` / `deepseek`），脚本统一用 `make_client()`；`LLM_PROVIDER` / `LLM_MODEL` 可临时覆盖；复现旧运行时按记录的模型名推断厂商。智谱请求参数不变，旧缓存继续命中。新增 6 个测试，共 133 个通过。key 已配置（长度 35），只放在 `.env` |
+| M.2 | 模型确认 | ✅ | `deepseek-chat` 已是旧别名，平台实际返回 `deepseek-flash`（DeepSeek-V4.1-Flash）；账号可用模型只有 `deepseek-flash` 和 `deepseek-v4-pro`。该模型**默认开启思考模式**（推理 token 计入输出，且忽略 temperature）。采用：**固定模型 ID `deepseek-flash`，显式关闭思考（`thinking: disabled`），temperature=0**，与原 `deepseek-chat` 的非思考口径一致。temperature=0 不保证逐字一致，实验组共享第 1 次尝试仍靠磁盘缓存保证 |
+| M.3 | 开发集基线（30 题） | ✅ | run `baseline-20260928T061407-9cbe67`（`baseline-v2` / k=20，与 glm 同配置）：**首次准确率 3/30 = 10%**（glm 0/30）；**可执行 24/30**（glm 4/30）；报错 6（列找不到 3、窗口 frame 不支持 2、列类型不兼容 1）；能执行但答错 21（其中空结果 2）。表召回 0.92（不变）。约 45.3 万 token，模型响应中位 3.0 秒（glm 约 16.5 秒） |
+| M.4 | 全部 Gold 提示上界（27 道失败题，只跑 `all`） | ✅ | 结果 `runs/phase3/intervention-baseline-20260928T061407-9cbe67/`：**7/27 能修好**（glm 0/30）；补提示后仍报错 4 题。修好的 7 题在标注器里的主因都是"选表"。27 题主因分布：选表 22、查询拆解 4、未知 1。27 次调用、约 43 万 token |
+
+**结论**：deepseek-flash 满足换模型的判据——给对信息能改对（7/27），说明信息而非模型能力是主要瓶颈，Loop 有发挥空间。按 Oracle 信息估计，开发集准确率上限约从 3/30 提升到 10/30；Loop 只用无 Gold 信号，实际收益会低于这个上限。
+**新暴露的问题**：失败形态从"跑不起来"变为"能跑但答错"（21/27）。现有 SelfVerifier 只能触发约 8 题（报错 6 + 空结果 2），其余会被直接放行，这将成为 Loop 效果的主要限制。
+**决策 D6**：默认模型**保持 glm-4-flash**，继续用免费模型修复代码、梳理流程；需要时再由用户通知切换为 `deepseek-flash`（改 `config/phase1.yaml` 的 provider / model，或临时设 `LLM_PROVIDER=deepseek`）。
+
+## 补强 Verifier · 第 1 步：规则检查的离线评估（2026-09-28）
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| V.1 | 语义检查模块 `loop_engineer/checks.py` | ✅ | 只用题干、生成的 SQL 和执行结果（不含 Gold）。静态检查：题干中的值是否出现在 SQL 里（带引号的值、年份、比较数字）、统计函数、分组、四舍五入、关联条件恒为真、JOIN 无条件、输出列数；结果检查：重复行、“对每个”却只有 1 行。测试 5 个 |
+| V.2 | 离线评估 `scripts/verifier_eval.py` | ✅ | 不调用 LLM。**抓错**：现有开发集运行中 30 个“能执行但答错”的尝试（按题目 + SQL 去重，含 glm / deepseek 基线与 Phase 6 Loop；`--reexecute` 在 Databricks 上重跑取完整结果行）。**误报**：开发集 30 题的 Gold SQL 与 Gold 结果，以及评测集以外 5,687 道 dw 题的 Gold SQL（仅静态检查）。评测集全程排除（D2） |
+| V.3 | 结果 | ✅ | 见下表。**30 个错题中 12 个被至少一个信号抓到，但能抓到错题的信号在正确答案上同样会触发**：重复行（错 7/30，正确 5/30；Gold 结果本身重复比例 35%–92%，与错题 21%–80% 完全重叠）、“对每个”只有 1 行（3/30 vs 4/30）、输出列数（3/30 vs 4/30，题干项数估计与 Gold 列数仅 1,323/4,543 一致）、题干中的值（1/30，但 Gold 误报 7.5%，原因是 BEAVER 题干与 Gold SQL 本身不完全对应）。误报接近 0 的规则（关联恒为真、JOIN 无条件、缺少分组、四舍五入）在这 30 个错题上命中为 0 |
+
+| 信号 | 抓到错题（/30） | 误报：开发集 Gold（/30） | 误报：其余 Gold（/5,687） | 结论 |
+|---|---|---|---|---|
+| 重复行 | 7 | 5 | —（需结果） | 不能用：正确答案也常有重复 |
+| “对每个”只有 1 行 | 3 | 4 | — | 不能用 |
+| 输出列数不足 | 3 | 4 | 10.8% | 不能用 |
+| 题干中的值缺失 | 1 | 1 | 7.5% | 只作提示 |
+| 缺少统计函数 | 0 | 0 | 4.2% | 只作提示 |
+| 缺少分组 | 0 | 0 | 0.3% | 可作触发（当前数据无命中） |
+| 关联条件恒为真 / JOIN 无条件 / 四舍五入 | 0 | 0 | ≈0 | 可作触发（当前数据无命中） |
+
+**结论**：在 BEAVER 上，这批“能执行但答错”的尝试主要是语义层面的细微错误（统计口径、关联路径、过滤范围），基于题干的规则检查区分不了对错；规则能安全覆盖的只有少数结构性错误。要提高自检能力，下一步需要评估**LLM 裁判**（按题干逐项核对 SQL）或**执行一致性**（另生成一个 SQL 比较结果），同样先离线在开发集上测抓错率和误报率。
+
+## 补强 Verifier · 第 2 步：接入安全规则（SelfVerifier v2）
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| V.4 | `SelfVerifier` v2（`VERIFIER_VERSION = self-v2`） | ✅ | 能执行且有结果时，对照题干运行语义检查：误报率≈0 的 4 个信号（`join_tautology`、`join_without_condition`、`missing_grouping`、`rounding`）判为自检未通过，其余检查结果作为“提示”记录（不触发修复）。“通过”仍然只表示没发现问题。`SelfVerifier(signals=BASIC_SIGNALS)` 可回到 v1 行为；运行元数据记录 `verifier_version` |
+| V.5 | 闭环 | ✅ | 自检发现的问题写入该次尝试的 `verifier_findings`（不含 Gold）→ Observer 白名单读取 → Diagnoser 规则映射（关联问题 → 关联键 → FindJoinPath；缺少分组 → 查询拆解 → ReplanQuery；四舍五入 → 执行错误 → RepairSQL）→ 修复 prompt 的“观察”部分写明检查发现的问题（每个检查带英文提示）。运行页的自检步骤展示触发项（红）和提示项（蓝）。测试：端到端用例（SQL 能执行但关联条件恒为真 → 自检未通过 → FindJoinPath → prompt 写明问题 → 修复后通过）；v1 信号集下行为不变；共 150 个测试通过 |
+
+## 补强 Verifier · 第 3 步：LLM 裁判的离线评估
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| V.6 | `loop_engineer/judge.py` + `scripts/judge_eval.py` | ✅ | LLM 裁判：给题干、SQL 用到的表的 schema、SQL、结果摘要，按清单逐项核对，输出 JSON（verdict / confidence / problems）。样本同第 1 步：30 个能执行但答错的尝试 + 33 个正确答案（开发集 30 道 Gold SQL 及结果 + 3 个模型答对的尝试）。评测集排除。测试 2 个 |
+| V.7 | judge-v1（glm-4-flash） | ✅ | 抓错 11/30、误报 4/33；但不少理由是“用了 STDDEV_POP 而不是 STDDEV”——按本仓库约定（生成规则 baseline-v2）这是正确写法。→ v2：裁判 prompt 加入与生成阶段相同的通用约定（统计函数对应、方言、大小写、代码为字符串、“(Course N)” = 院系代码 N），不涉及具体题目和 Gold |
+| V.8 | judge-v2 结果 | ✅ | **glm-4-flash**：抓错 10/30、误报 4/33（置信度几乎全是 0.8，阈值无区分力）。**deepseek-flash**：抓错 27/30、误报 **31/33**（Gold 30 道判错 28 道），另有 5 次输出被截断无法解析（max_output_tokens=512）。复查 DeepSeek 对 Gold 的批评，很多**成立**：dw_2277 题干要数学或物理、Gold 只筛数学；dw_4188 Gold 多了 `WITH ROLLUP`；dw_4162 题干是“或”、Gold 实现成“且”。**BEAVER 的题干与 Gold SQL 本身经常不一致**（先有 SQL、后生成问题），而评测按结果与 Gold 一致判分 |
+
+**结论（决策 V1）**：在 BEAVER 上，“拿题干核对 SQL”的自检方法有天花板——题干不是可靠的规格。严格的裁判（DeepSeek）会把 SQL 改向字面意思、离 Gold 更远，接入会造成大量误伤；宽松的裁判（glm）误报低但主要因为看得粗。因此 **LLM 裁判不作为触发修复的信号**，保留代码，可作为运行页 / 报告里的提示。SelfVerifier 保持 v2（结构规则）。这也说明对这个基准，Loop 能可靠处理的主要是“显式失败”（报错、空结果、结构性错误），“能执行但语义错”的改进空间更多在生成端（更强的模型、更好的检索）而不是自检端。
+
+## 补强 Verifier · 第 4 步：数值一致性检查（“计算器”）
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| V.9 | `check_numeric`（`loop_engineer/checks.py`） | ✅ | 数值计算全部由数据库完成、核对由代码完成，大模型不参与。把每个输出列对应到产生它的统计函数（顺着 CTE 别名追溯；四舍五入、COUNT(DISTINCT) 等不确定的列跳过），检查必然成立的关系：统计量非负、计数为整数、min ≤ max、min ≤ avg ≤ max、同族（均为 _POP 或均为 _SAMP）的方差 = 标准差²、标准差 ≤ 极差。不依赖题干，因此不受 BEAVER 题干与 Gold 不一致的影响。测试 3 个 |
+| V.10 | 离线评估（`verifier_eval.py --reexecute --mysql-pool 400`） | ✅ | 新增正确样本：评测集以外 399 道带统计函数的 Gold SQL 在本地 MySQL 上执行得到的结果。可检查的样本：错题 22/30、开发集 Gold 21/30、MySQL Gold 357/399。**误报 0**（378 个正确结果）；**抓错 0/22**——这批错题的数值都是自洽的，错在“算什么”而不是“怎么算” |
+| V.11 | 接入 | ✅ | 6 个数值信号加入 `TRIGGER_SIGNALS`（零成本、零误报，能在统计量来自不同行集时发现问题）；诊断映射：数值矛盾 → 查询拆解 → ReplanQuery，负数 / 非整数计数 → 执行错误 → RepairSQL。端到端测试：平均值不在 [最小值, 最大值] → 自检未通过 → ReplanQuery，修复 prompt 写明矛盾。共 156 个测试通过 |
+
+**补强 Verifier 小结**：四种方法都在开发集上用同一套离线评估测了抓错率和误报率——题干规则（能抓的误报高，安全的抓不到）、LLM 裁判（受 BEAVER 题干与 Gold 不一致限制，严格的 DeepSeek 误报 31/33）、数值一致性（零误报、这批零命中）。最终 SelfVerifier v2 = 显式失败信号 + 4 条结构规则 + 6 条数值规则，全部零误报。对这个基准，“能执行但语义错”的问题靠自检无法可靠发现，改进空间主要在生成端（更强的模型、更好的检索 / 提示）。
+
+## 提升正确率 · 生成端：相似题示例（dynamic few-shot，prompt baseline-v3-dynfs）
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| G.1 | 错误分析 `scripts/analyze_run.py` | ✅ | 对线上 deepseek-flash 运行 `console-targeted-self-20260928T105340-eef1a9`（开发集 30 题、self-v2、最多修复 4 次：答对 3→3，可执行 24→29）逐题对照开发集 Gold：26 道能执行但答错中 **22 道首要原因是用表与 Gold 不同**（其余查询拆解 3、未知 1）；列数一致 23/26，行数一致仅 8/26。Gold 用到而生成 SQL 没用的表共 41 次，其中 **34 次在检索结果里**——不是检索不到，而是在多张相似表（subject_offered / subject_offered_summary / tip_subject_offered …）中选错 |
+| G.2 | 潜力验证 | ✅ | 已解题库（dw 全部题目 − 评测集 − 开发集，5,657 道）按问题 BM25 取前 5 道，其用表平均覆盖开发集 Gold 用表的 88.5%，7/30 题能找到用表完全一致的示例。泄漏检查：开发集 30 题在示例库前 4 条里没有相同的 Gold SQL 或相同题干 |
+| G.3 | 实现 | ✅ | `agent/examples.py`（示例库 + BM25 相似题检索，Gold SQL 经 Phase 0 适配规则、可解析且不超过 2,500 字符，共 5,508 道）；`FewShotGenerator(index=...)` 每题换成最相似的 4 道示例，并把示例用到的表（最多 6 张）补进 schema；默认仍为固定示例（`few_shot.mode: static`），`--few-shot dynamic` 或运行页“Few-shot 示例”选项切换；运行元数据记录 `prompt_version` / `few_shot`；运行页生成步骤展示所用示例和补充的表。测试 2 个，共 158 个通过 |
+| G.4 | glm-4-flash 开发集基线（只换示例方式） | ✅ | run `baseline-20260928T110813-2524c9`：**答对 0/30 → 3/30，可执行 4/30 → 16/30**，平均 token 1.38 万 → 1.53 万（+11%）。免费模型只改生成端就达到此前 deepseek-flash 固定示例的首次准确率 |
+
+**结论**：“能执行但语义错”的主因是选表，而自检无法可靠发现；改进放在生成端（用同类已解题告诉模型这个数仓的用表习惯）效果明显。下一步：用 deepseek-flash 做同样对比，并在 Loop（带修复）下测。
+
+## 补强 Verifier · 第 5 步：查数据库的验证子 Agent（离线评估）
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| V.12 | `loop_engineer/validators.py`（ValidatorAgent） | ✅ | 用小的只读查证 SQL 取证，不调用 LLM、不接触 Gold：**过滤值存在性**（`col = 'v'` / `IN (...)` 的字符串值是否在该列中出现，不存在则给出最接近的真实值）；**关联导致统计量放大**（对 T 表的列做 SUM / AVG / COUNT，而关联的 U 表在关联键上不唯一：`COUNT(*)` vs `COUNT(DISTINCT 关联键)`）。每条 SQL 最多 12 条查证、结果缓存。测试 4 个（假数据库） |
+| V.13 | 离线评估 `scripts/validator_eval.py --pool 300` | ✅ | 错题 30、正确 33（开发集 Gold + 模型答对）、评测集以外随机 300 道 Gold；共 998 条查证。**过滤值不存在**：抓错 0/30、误报 0/33、Gold 抽样 2/300（0.7%）——模型会照抄 schema 样例值，这类错误几乎不出现。**关联放大**：抓错 5/30（实际 3 道不同题）、误报 **7/33**、Gold 抽样 **67/300（22%）**——BEAVER 的 Gold 本身大量“先关联非唯一键再聚合”；dw_5072 的错误答案和它的 Gold 放大方式完全相同，放大不是它答错的原因 |
+
+**结论（决策 V2）**：两个验证器只作提示、不触发修复。四轮自检实验（题干规则、LLM 裁判、数值一致性、查数据库验证）得到同一结论：不看标准答案的检查衡量的是“通常意义上的正确”，而 BEAVER 的 Gold 有自己的约定（偏好的表、看似多余的关联、与字面不同的口径），这些约定只能从已解题中学习——对应外层循环 / 相似题示例（同一批题上 glm 答对 0 → 3）。在真实生产中（问题即需求、没有基准约定），过滤值和关联放大检查仍有价值，代码保留。
+
+## 提升正确率 · 验证：deepseek-flash + 相似题示例；统计函数口径的标注不一致
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| G.5 | deepseek-flash 对比（用户在线运行，开发集 30 题，Loop 最多修复 4 次） | ✅ | 固定示例 `console-targeted-self-20260928T105340-eef1a9`：最终答对 **3**、能执行但错 26；相似题示例 `console-targeted-self-20260928T163214-3a5715`：最终答对 **8**、能执行但错 21。生成端改进在更强的模型上同样有效，且提升更大 |
+| G.6 | 报告显示问题 | ✅ | 分析报告里的“最终答案结果预览”原先按 300 字符截断，会切断字符串（如 `"Mathemat`），看起来像数据被截断。**只是显示问题**：判分始终用执行返回的完整结果行。改为按行完整显示前 5 行并标注总行数（`app/report.py` `preview_block`） |
+| G.7 | dw_1058 的真实错因 | ✅ | 生成 SQL 与 Gold 只差标准差函数：生成用 `STDDEV_POP`（3.23324），Gold 用 `STDDEV_SAMP`（3.24279），其余 6 列 7 行完全一致。根源是生成规则 4（baseline-v2，决策 D2）要求标准差 / 方差一律用 `_POP` |
+| G.8 | 规则影响范围 | ✅ | 评测集以外含 “never STDDEV_POP” 的 2,087 道题：Gold 用总体函数 1,802（86%）、样本函数 153（7%）、两者都用 132（6%）；不带这句话的 1,107 道全部是总体函数。**两类题干文字完全相同**（都是 “using STDDEV only and never STDDEV_POP”），属于 BEAVER 标注本身的不一致；按多数选总体函数已是只看题干时的最优策略，规则保留。两次 deepseek 运行的错题中，把 `_POP` 换成 `_SAMP` 后变对的只有 dw_1058 一道（这部分是不可消除的误差，不是主要错因） |
+
+## 提升正确率 · 错误分类（deepseek-flash + 相似题示例 + Loop）
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| G.9 | 21 道“能执行但错”的分类 | ✅ | run `console-targeted-self-20260928T163214-3a5715`。`analyze_run.py` 标出 8 道选表问题、2 道查询拆解、11 道“未知”（与 Gold 用的表、列、关联键、字面值、统计运算都一致）；对“未知”再做细粒度对比（关联方式、过滤条件、分组、HAVING、DISTINCT、统计函数、窗口、LIMIT）并人工复核后分为 6 类：**A 选错表 / 用表不全 8（38%）**；**B 关联方式 / 路径 4（19%）**（dw_4188 INNER vs Gold LEFT，49 vs 12 行；dw_4740 多一个 LEFT JOIN；dw_2309 少 3 个关联；dw_5072 汇总粒度不同，求和差约 1000 倍）；**C 查询结构 / 拆解 4（19%）**（分组粒度、argmax 写法、Top-K、输出列）；**D 过滤条件理解 2（10%）**（dw_4162 “21E” 匹配到 12-321E；dw_841 按名称还是代码排除）；**E 题干与 Gold 不一致 2（10%）**（dw_2277、dw_2433）；**F 统计函数口径 1（5%）**（dw_1058） |
+
+**结论**：E + F（3 题，约 14%）是基准噪声，不作为改进目标；A + B（12 题，57%）属于“数仓使用约定”（用表、关联键、关联方式），可以从训练集（评测集与开发集以外的 5,500 道已解题）统计得到，作为外层循环第一批知识；C + D 属于理解和结构问题，靠相似题示例、多候选或更强模型，放在后面。
+
+## 外层循环 · 第 1 步：数仓使用说明（kb-v1，prompt +kb）
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| K.1 | `agent/knowledge.py` + `scripts/build_knowledge.py` | ✅ | 离线从训练集（评测集与开发集以外的 5,656 道已解题）统计三类约定：**概念 → 表**（题干词 → 已解题所用表，按 IDF 加权）、**相似表**（列名 Jaccard ≥ 0.5 的 4 组：academic_terms / _all、cis_course_catalog / course_catalog_subject_offered、fclt_building / _hist、library_subject_offered / tip_subject_offered）、**关联约定**（134 对表的常用关联键与 INNER / LEFT 比例）。运行时每题只取相关的几条作为“数仓使用说明”放进 prompt（约 10 行），不含该题的任何 Gold 信息。开关：`--knowledge on` / `knowledge.mode` / 运行页“数仓使用说明”；prompt 版本加 `+kb`。测试 3 个，共 165 个通过 |
+| K.2 | glm-4-flash 开发集对比（相似题示例 vs 相似题示例 + 使用说明，单次生成不修复） | ✅ | run `baseline-20260928T171726-e8ae97`：**答对 3 → 5**，能执行 16 → 16，平均 token +3%。新答对 dw_4879、dw_977（此前 deepseek 错误分析中都属“选错表”）；没有原来答对的题变错。另有 3 道原本能执行但答错的题变成报错、1 道报错变成能执行但错。30 题样本上 +2 题幅度有限，需在 deepseek 上复核 |

@@ -17,7 +17,7 @@ from typing import Any
 
 from benchmark.beaver import adapter, compatibility, replicate
 from benchmark.beaver.dataset import BeaverCase
-from benchmark.beaver.evaluator import serialize_rows
+from benchmark.beaver.evaluator import CROSS_ENGINE_RULE, serialize_rows
 from dbx import tables
 from dbx.catalog import Layout, table_exists, upload_file, write_rows
 
@@ -162,7 +162,8 @@ def run_compatibility(cases: list[BeaverCase], mysql: Any, dbx: Any, layout: Lay
     for i, case in enumerate(cases, 1):
         rec, ref_runs, _ = compatibility.validate_case(case, mysql, dbx, qc.repeats)
         log.info("[%d/%d] %s → %s (%s)", i, len(cases), case.case_id, rec.compatibility_status, rec.reason)
-        compat_rows.append({**rec.to_row(), "run_id": run_id, "environment": qc.environment, "created_at": now()})
+        env = json.dumps({**json.loads(qc.environment), "comparison": CROSS_ENGINE_RULE})
+        compat_rows.append({**rec.to_row(), "run_id": run_id, "environment": env, "created_at": now()})
         if qc.try_adapter and rec.compatibility_status not in (compatibility.COMPATIBLE,
                                                                compatibility.REFERENCE_FAILED):
             ad = adapter.try_adapt(case, ref_runs, dbx, qc.repeats)
@@ -172,7 +173,7 @@ def run_compatibility(cases: list[BeaverCase], mysql: Any, dbx: Any, layout: Lay
         write_rows(dbx, layout, layout.benchmark, "gold_adaptations", adapt_rows, tables.ADAPTATIONS)
     summary = summarize_compatibility(compat_rows, adapt_rows)
     summary["run_id"] = run_id
-    save_local("03_compatibility.json", {**summary, "records": compat_rows, "adaptations": adapt_rows})
+    save_local("03_compatibility.json", {**summary, "records": compat_rows, "adaptation_records": adapt_rows})
     return summary
 
 
@@ -180,6 +181,7 @@ def summarize_compatibility(compat_rows: list[dict], adapt_rows: list[dict]) -> 
     by_status = Counter(r["compatibility_status"] for r in compat_rows)
     n = len(compat_rows)
     executable = sum(r["execution_status"] == "SUCCESS" for r in compat_rows)
+    equivalent = [a for a in adapt_rows if a["semantic_validation"] == adapter.RESULT_EQUIVALENT]
     return {
         "cases": n,
         "by_status": {s: by_status.get(s, 0) for s in compatibility.STATUSES},
@@ -187,6 +189,8 @@ def summarize_compatibility(compat_rows: list[dict], adapt_rows: list[dict]) -> 
         "executes_and_matches_mysql": by_status.get(compatibility.COMPATIBLE, 0),
         "compatible_rate": round(by_status.get(compatibility.COMPATIBLE, 0) / n, 4) if n else None,
         "adaptations": dict(Counter(a["semantic_validation"] for a in adapt_rows)),
+        "adaptations_by_rule": dict(Counter(a["adaptation_rule"] for a in equivalent)),
+        "usable_with_adaptations": by_status.get(compatibility.COMPATIBLE, 0) + len(equivalent),
         "static_hazards": dict(Counter(h for r in compat_rows for h in filter(None, r["static_hazards"].split(","))))
     }
 
@@ -196,29 +200,38 @@ def summarize_compatibility(compat_rows: list[dict], adapt_rows: list[dict]) -> 
 
 def build_gold_results(cases: list[BeaverCase], dbx: Any, layout: Layout, compat_run_id: str,
                        qc: QualificationConfig) -> dict:
-    """Execute the qualified SQL on Databricks, verify against the MySQL result hash
-    from the compatibility run, and freeze it as benchmark.gold_results."""
+    """Re-execute the qualified SQL on Databricks in a fresh session and freeze it as
+    benchmark.gold_results.
+
+    Equivalence with MySQL (the official engine) was established in the
+    compatibility run under the cross-engine comparison rule; here the result
+    must reproduce the Databricks result hash recorded in that run (drift check).
+    """
     fq_c = layout.fq(layout.benchmark, "sql_compatibility")
     fq_a = layout.fq(layout.benchmark, "gold_adaptations")
     compat = {r[0]: r[1:] for r in dbx.run(
-        f"SELECT case_id, compatibility_status, reference_result_hash, reason FROM {fq_c} WHERE run_id = '{compat_run_id}'")}
+        f"SELECT case_id, compatibility_status, reference_result_hash, reason, result_hash "
+        f"FROM {fq_c} WHERE run_id = '{compat_run_id}'")}
     if not compat:
         raise RuntimeError(f"no compatibility records for run {compat_run_id}")
-    adapted: dict[str, str] = {}
+    adapted: dict[str, tuple[str, str, str]] = {}
     if table_exists(dbx, layout, layout.benchmark, "gold_adaptations"):
-        adapted = dict(dbx.run(f"SELECT case_id, adapted_sql FROM {fq_a} WHERE run_id = '{compat_run_id}' "
-                               f"AND semantic_validation = '{adapter.RESULT_EQUIVALENT}'"))
+        adapted = {r[0]: (r[1], r[2], r[3]) for r in dbx.run(
+            f"SELECT case_id, adapted_sql, adapted_result_hash, adaptation_rule FROM {fq_a} "
+            f"WHERE run_id = '{compat_run_id}' AND semantic_validation = '{adapter.RESULT_EQUIVALENT}'")}
     run_id = new_run_id("gold")
     out = []
     for case in cases:
-        status, ref_hash, reason = compat.get(case.case_id, (None, None, "not in compatibility run"))
+        status, ref_hash, reason, dbx_hash = compat.get(case.case_id, (None, None, "not in compatibility run", None))
         base = {"case_id": case.case_id, "db": case.db, "gold_sql": case.gold_sql,
-                "verified_against": "mysql (BEAVER official engine)", "reference_result_hash": ref_hash,
+                "verified_against": f"mysql (BEAVER official engine); {CROSS_ENGINE_RULE}",
+                "reference_result_hash": ref_hash,
                 "qualification_run_id": compat_run_id, "created_at": now()}
         if status == compatibility.COMPATIBLE:
-            sql, source, eligibility = case.gold_sql, "databricks_original_gold_sql", "PRIMARY"
+            sql, source, eligibility, expected = case.gold_sql, "databricks_original_gold_sql", "PRIMARY", dbx_hash
         elif case.case_id in adapted:
-            sql, source = adapted[case.case_id], "databricks_adapted_sql"
+            sql, expected, rule = adapted[case.case_id]
+            source = f"databricks_adapted_sql:{rule}"
             eligibility = "PRIMARY" if qc.admit_validated_adaptations else "SECONDARY"
         else:
             out.append({**base, "executed_sql": None, "gold_result": None, "result_hash": None, "row_count": None,
@@ -228,7 +241,7 @@ def build_gold_results(cases: list[BeaverCase], dbx: Any, layout: Layout, compat
             continue
         runs = compatibility.run_repeated(dbx, sql, case.db, qc.repeats)
         h = runs.result_hashes[0] if runs.result_hashes else None
-        drift = runs.status != "SUCCESS" or not runs.stable or h != ref_hash
+        drift = runs.status != "SUCCESS" or not runs.stable or h != expected
         out.append({**base, "executed_sql": sql,
                     "gold_result": serialize_rows(runs.rows) if not drift else None,
                     "result_hash": h, "row_count": runs.row_count,
@@ -237,8 +250,8 @@ def build_gold_results(cases: list[BeaverCase], dbx: Any, layout: Layout, compat
                     "execution_time": int(sum(runs.elapsed_ms) / len(runs.elapsed_ms)) if runs.elapsed_ms else None,
                     "gold_source": source,
                     "evaluation_eligibility": "EXCLUDED" if drift else eligibility,
-                    "exclusion_reason": ("gold_result_drift: re-execution does not reproduce the qualified "
-                                         "MySQL result") if drift else None})
+                    "exclusion_reason": ("gold_result_drift: re-execution does not reproduce the result "
+                                         "qualified in the compatibility run") if drift else None})
     write_rows(dbx, layout, layout.benchmark, "gold_results", out, tables.GOLD_RESULTS, mode="overwrite")
     elig = Counter(r["evaluation_eligibility"] for r in out)
     summary = {"run_id": run_id, "compat_run_id": compat_run_id, "cases": len(out),
