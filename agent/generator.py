@@ -143,11 +143,12 @@ class FewShotGenerator:
     k: int = 4
     max_extra_tables: int = 6
     knowledge: Any = None        # agent/knowledge.py WarehouseKnowledge: usage notes per question
+    curated: Any = None          # agent/curated.py CuratedKnowledge: reviewed notes (+ verified queries in index)
 
     @property
     def prompt_version(self) -> str:
         base = PROMPT_VERSION_DYNAMIC if self.index is not None else PROMPT_VERSION
-        return base + ("+kb" if self.knowledge is not None else "")
+        return base + ("+kb" if self.knowledge is not None else "") + ("+cur" if self.curated else "")
 
     def generate(self, task: AgentTask, tables: tuple[str, ...], oracle_hints: list[str] | None = None) -> Generation:
         """``oracle_hints`` carry GOLD annotations (BEAVER setting=1/2). Offline diagnostic analysis
@@ -158,7 +159,12 @@ class FewShotGenerator:
             examples = [h.example for h in hits]
             extra = [t for h in hits for t in h.tables if t in self.catalog.tables and t not in tables]
             tables = tuple(tables) + tuple(dict.fromkeys(extra))[: self.max_extra_tables]
+        if self.curated:  # approved table hints: tables weak models tend to leave out for such questions
+            tables = tuple(tables) + tuple(t for t in self.curated.extra_tables(task.question, tables)
+                                           if t in self.catalog.tables)
         notes = self.knowledge.notes_for(task.question, tables) if self.knowledge is not None else ""
+        reviewed = self.curated.notes_for(task.question, tables) if self.curated else ""
+        notes = "\n\n".join(n for n in (reviewed, notes) if n)      # reviewed notes first: they outrank counts
         prompt = build_prompt(task, render_schema(self.catalog, tables), examples, oracle_hints, notes)
         r = self.client.complete(prompt, system=SYSTEM)
         sql, status = extract_sql(r.text)

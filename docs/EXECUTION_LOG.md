@@ -402,5 +402,19 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 
 | 步骤 | 内容 | 状态 | 结果摘要 |
 |---|---|---|---|
-| K.1 | `agent/knowledge.py` + `scripts/build_knowledge.py` | ✅ | 离线从训练集（评测集与开发集以外的 5,656 道已解题）统计三类约定：**概念 → 表**（题干词 → 已解题所用表，按 IDF 加权）、**相似表**（列名 Jaccard ≥ 0.5 的 4 组：academic_terms / _all、cis_course_catalog / course_catalog_subject_offered、fclt_building / _hist、library_subject_offered / tip_subject_offered）、**关联约定**（134 对表的常用关联键与 INNER / LEFT 比例）。运行时每题只取相关的几条作为“数仓使用说明”放进 prompt（约 10 行），不含该题的任何 Gold 信息。开关：`--knowledge on` / `knowledge.mode` / 运行页“数仓使用说明”；prompt 版本加 `+kb`。测试 3 个，共 165 个通过 |
+| K.1 | `agent/knowledge.py` + `scripts/build_knowledge.py` | ✅ | 离线从训练集（评测集与开发集以外的 5,656 道已解题）统计三类约定：**概念 → 表**（题干词 → 已解题所用表，按 IDF 加权）、**相似表**（列名 Jaccard ≥ 0.5 的 4 组：academic_terms / _all、cis_course_catalog / course_catalog_subject_offered、fclt_building / _hist、library_subject_offered / tip_subject_offered）、**关联约定**（134 对表的常用关联键与 INNER / LEFT 比例）。运行时每题只取相关的几条作为“数仓使用说明”放进 prompt（7–13 行，开发集实测多数 12–13 行），不含该题的任何 Gold 信息。开关：`--knowledge on` / `knowledge.mode` / 运行页“数仓使用说明”；prompt 版本加 `+kb`。测试 3 个，共 165 个通过 |
 | K.2 | glm-4-flash 开发集对比（相似题示例 vs 相似题示例 + 使用说明，单次生成不修复） | ✅ | run `baseline-20260928T171726-e8ae97`：**答对 3 → 5**，能执行 16 → 16，平均 token +3%。新答对 dw_4879、dw_977（此前 deepseek 错误分析中都属“选错表”）；没有原来答对的题变错。另有 3 道原本能执行但答错的题变成报错、1 道报错变成能执行但错。30 题样本上 +2 题幅度有限，需在 deepseek 上复核 |
+
+## 产品化闭环 · 提问 / 反馈 / 外循环提案 / 审核上线（outer-v1）
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| P.1 | 提问页 `app/app_pages/ask.py` + `app/runner.py`（`build_controller` 抽出共用、`AskRun` / `start_ask` / `submit_feedback`） | ✅ | 用户问题只走内循环（SelfVerifier，无 Gold）；问题与各次尝试写入 `experience.user_queries`；👍 / 👎、原因、修正 SQL（先只读执行校验）、备注写入 `experience.feedback`。端到端实测（glm-4-flash）：“每栋楼有多少房间” 第 1 次执行失败 → 诊断 → 修复 → 自检通过，165 行，已写入 Delta |
+| P.2 | `dbx/experience.py` + `dbx/tables.py` 四张表：user_queries、feedback、proposals、knowledge_items | ✅ | 在临时 schema `experience_selftest` 上走完全流程后删除：提案 pending → 批准（提案 approved + 知识 active）→ `load_curated` 读到并生成 prompt 说明 → 停用后不再生效（inactive 可追溯）；同一问题多次反馈取最新一条；含单引号的文本正确转义 |
+| P.3 | `agent/curated.py`：已审核知识进入生成端 | ✅ | 四类：选表偏好、补表提示（把漏掉的表加进 schema）、关联规则、已验证查询（加入相似题示例库）。说明排在统计说明之前；prompt 版本加 `+cur`；每次运行时从 Delta 读取，批准 / 停用对下一次提问生效 |
+| P.4 | `evaluation/outer_loop.py` + `scripts/outer_loop.py`：训练集抽题 → 生成并对照 Gold 判分 → 归纳候选 → 开发集回归门禁 → 待审核提案 | ✅ | 门禁：答对不减少、零误伤、token 增幅 ≤ 20%；评测集不参与。训练题生成时示例库排除这些训练题本身 |
+| P.5 | 第 1 次迭代（glm-4-flash，训练 60 题，其中 59 题 Gold 可执行） | ⚠️ | 训练集答对 13 / 59；错因以选表（22）、列映射（13）为主。**候选 0 条**：原规则只找“用了相似表 X 而不是 Y”，实际只有 1 例；glm 的选表错误几乎都是**漏表**（academic_terms 漏 8 次、sis_subject_code 5 次、sis_course_description 4 次）。据此新增候选类型“补表提示”（`mine_missing_tables`），并在 proposals.json 中保存每道错题的用表对照 |
+| P.6 | 第 2 次迭代（同一抽样，加入补表提示） | ✅ 门禁生效 | batch `batch-20260929T173746-195ecd`：9 条补表提示写入 `experience.proposals`。开发集回归 **答对 5 → 4**，能执行 16 → 14，误伤 dw_4867，token +4.5% → **门禁未通过，建议驳回**。问题：关键词噪声大（如 five、12、least、2021fa），提示在不相关问题上也会触发；整批一起回归，好坏条目无法区分 |
+| P.7 | 审核页 `app/app_pages/review.py`；导航改为 提问 / 审核 / Console / 运行 Loop；运行页加“已审核知识”开关 | ✅ | 审核页按批次显示提案、证据、开发集回归和建议，可批准 / 驳回（`SHT_REVIEWERS` 可限定审核人），已生效知识可停用，另有用户反馈和审核记录。headless（AppTest）读 Delta 验证通过。测试 174 个通过；已重新部署 Databricks App |
+
+下一步：关键词只保留在支持题中多次出现、且指向该表比例高的内容词（去掉数字和泛词）；门禁改为逐条（或小组）回归，只把通过的条目推荐批准；邮件通知待提供 SMTP 后再加。

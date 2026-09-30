@@ -114,6 +114,8 @@ def main() -> None:
             "knowledge": (cfg.get("knowledge") or {}).get("mode", "off"),
             "diagnoser": DIAGNOSER_VERSION, "max_attempts": args.max_repairs + 1,
             "case_ids": [c.case_id for c in cases]}
+    
+    # 运行入口
     run_id, summary = run_arm(cases, judges, controller, verifier_for, arm, Path("runs/phase6"), meta)
     summary["llm_usage"] = meter.snapshot()
     (Path("runs/phase6") / run_id / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False),

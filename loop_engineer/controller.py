@@ -113,8 +113,10 @@ class LoopController:
             except Exception:  # an observer must never break the loop
                 log.exception("on_event(%s) failed", step)
 
+        # 检索与问题相关的候选表 BM25
         retrieval = self.retriever.retrieve(task.question, self.cfg.top_k)
         emit("retrieve", tables=list(retrieval.tables), scores=list(retrieval.scores))
+        # 生成SQL语句
         gen = self.generator.generate(task, retrieval.tables)
         # dynamic few-shot may add the tables of similar solved questions to the schema the model saw
         shown = list(getattr(gen, "schema_tables", ()) or retrieval.tables)
@@ -133,7 +135,9 @@ class LoopController:
              knowledge_notes=getattr(gen, "notes", "") or "",
              prompt=gen.prompt, raw_response=gen.raw[:4000])
         attempts, all_rows = [], []
+        # 开始尝试运行SQL
         for n in range(1, self.cfg.max_attempts + 1):
+            # 执行SQL语句
             exe, rows = self._execute(attempt["generated_sql"], task.db, attempt["parse_status"])
             attempt.update(exe)
             emit("execute", attempt_id=n, sql=attempt["generated_sql"], **exe)

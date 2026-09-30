@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -139,6 +140,7 @@ class RunRequest:
     max_repairs: int = 1          # repair rounds per question; SQL attempts = max_repairs + 1
     few_shot: str = "static"      # static (fixed examples) | dynamic (similar solved questions, agent/examples.py)
     knowledge: bool = False       # add warehouse usage notes mined from solved queries (agent/knowledge.py)
+    curated: bool = False         # use knowledge approved on the Review page (agent/curated.py)
     publish: bool = True
 
 
@@ -188,21 +190,57 @@ def _out_root() -> Path:
     return local
 
 
-def _execute(live: LiveRun, bundle: Bundle, connect) -> None:
+def build_controller(bundle: Bundle, inner: Any, conn: Any, strategy: str, max_repairs: int, few_shot: str,
+                     knowledge: bool, curated: bool):
+    """Same assembly as scripts/phase6.py: retriever, generator (+ dynamic few-shot / usage notes / reviewed
+    knowledge), executor, diagnoser, policy, repair context. Returns (controller, generator)."""
     from agent.generator import FewShotGenerator
-    from agent.llm import CachingChatClient, UsageMeter, make_client
+    from agent.llm import CachingChatClient
     from agent.retriever import BM25TableRetriever
+    from loop_engineer.controller import LoopConfig, LoopController
+    from loop_engineer.diagnose import Diagnoser
+    from loop_engineer.policy import Policy
+    from skills.base import RepairContext
+
+    cfg = bundle.config
+    client = CachingChatClient(inner, _cache_path())
+    fs = cfg.get("few_shot", {})
+    index = bundle.example_index() if few_shot == "dynamic" else None
+    if few_shot == "dynamic" and index is None:
+        raise FileNotFoundError("examples_pool.json missing from the app bundle; rerun scripts/build_app_bundle.py")
+    kb = None
+    if knowledge:
+        from agent.knowledge import load_knowledge
+        kb = load_knowledge(BUNDLE / "kb.json")
+        if kb is None:
+            raise FileNotFoundError("kb.json missing from the app bundle; run scripts/build_knowledge.py and "
+                                    "scripts/build_app_bundle.py")
+    generator = FewShotGenerator(client, bundle.catalog, bundle.examples, index=index,
+                                 k=int(fs.get("dynamic_k", 4)), max_extra_tables=int(fs.get("dynamic_max_extra_tables", 6)),
+                                 knowledge=kb)
+    if curated:  # approved knowledge is read at every run, so approvals / rollbacks apply to the next question
+        from agent.curated import attach_curated, load_curated
+        from dbx.catalog import Layout
+        attach_curated(generator, load_curated(conn, Layout(CATALOG)))
+    controller = LoopController(BM25TableRetriever(bundle.catalog), generator, conn,
+                                Diagnoser(bundle.catalog, client), Policy(),
+                                RepairContext(bundle.catalog, client, bundle.examples),
+                                LoopConfig(strategy=strategy, max_attempts=max_repairs + 1,
+                                           top_k=int(cfg["retrieval"]["top_k"]),
+                                           max_result_rows=int(cfg["databricks"]["max_result_rows"])))
+    return controller, generator
+
+
+def _execute(live: LiveRun, bundle: Bundle, connect) -> None:
+    from agent.llm import UsageMeter, make_client
     from dbx.catalog import Layout
     from dbx.publish import publish_run
     from evaluation.loop_run import run_arm
-    from loop_engineer.controller import LoopConfig, LoopController
-    from loop_engineer.diagnose import DIAGNOSER_VERSION, Diagnoser
-    from loop_engineer.policy import Policy
+    from loop_engineer.diagnose import DIAGNOSER_VERSION
     from loop_engineer.verifier import SELF_SIGNALS, VERIFIER_VERSION, OracleVerifier, SelfVerifier
-    from skills.base import RepairContext
 
     req, cfg = live.request, bundle.config
-    lc, d = cfg["llm"], cfg["databricks"]
+    lc = cfg["llm"]
     conn = connect()  # own warehouse connection per run thread
     try:
         cases, judges = _cases_and_judges(bundle, req.split, req.case_ids, conn)
@@ -211,27 +249,8 @@ def _execute(live: LiveRun, bundle: Bundle, connect) -> None:
         calls = (1 + 2 * r) * n + 4
         meter = UsageMeter(max_calls=calls, max_tokens=30_000 * calls)
         inner = make_client(model=req.model, max_output_tokens=int(lc["max_output_tokens"]), meter=meter)
-        client = CachingChatClient(inner, _cache_path())
-        fs = cfg.get("few_shot", {})
-        index = bundle.example_index() if req.few_shot == "dynamic" else None
-        if req.few_shot == "dynamic" and index is None:
-            raise FileNotFoundError("examples_pool.json missing from the app bundle; rerun scripts/build_app_bundle.py")
-        kb = None
-        if req.knowledge:
-            from agent.knowledge import load_knowledge
-            kb = load_knowledge(BUNDLE / "kb.json")
-            if kb is None:
-                raise FileNotFoundError("kb.json missing from the app bundle; run scripts/build_knowledge.py and "
-                                        "scripts/build_app_bundle.py")
-        generator = FewShotGenerator(client, bundle.catalog, bundle.examples, index=index,
-                                     k=int(fs.get("dynamic_k", 4)), max_extra_tables=int(fs.get("dynamic_max_extra_tables", 6)),
-                                     knowledge=kb)
-        controller = LoopController(BM25TableRetriever(bundle.catalog), generator, conn,
-                                    Diagnoser(bundle.catalog, client), Policy(),
-                                    RepairContext(bundle.catalog, client, bundle.examples),
-                                    LoopConfig(strategy=req.strategy, max_attempts=req.max_repairs + 1,
-                                               top_k=int(cfg["retrieval"]["top_k"]),
-                                               max_result_rows=int(d["max_result_rows"])))
+        controller, generator = build_controller(bundle, inner, conn, req.strategy, req.max_repairs, req.few_shot,
+                                                 req.knowledge, req.curated)
         verifier_for = ((lambda cid: SelfVerifier()) if req.verifier == "self"
                         else (lambda cid: OracleVerifier(judges[cid])))
         arm = f"console-{req.strategy}-{req.verifier}"
@@ -239,7 +258,7 @@ def _execute(live: LiveRun, bundle: Bundle, connect) -> None:
                 "upper_bound": req.verifier == "oracle", "policy": "targeted", "disabled": "", "source": "console",
                 "self_signals": list(SELF_SIGNALS), "verifier_version": VERIFIER_VERSION, "model": inner.model, "provider": inner.provider,
                 "prompt_version": generator.prompt_version, "few_shot": req.few_shot,
-                "knowledge": "on" if req.knowledge else "off", "diagnoser": DIAGNOSER_VERSION,
+                "knowledge": "on" if req.knowledge else "off", "curated": req.curated, "diagnoser": DIAGNOSER_VERSION,
                 "max_attempts": req.max_repairs + 1, "max_repairs": req.max_repairs,
                 "case_ids": [c.case_id for c in cases]}
         run_id, summary = run_arm(cases, judges, controller, verifier_for, arm, _out_root(), meta,
@@ -280,3 +299,134 @@ def start_run(request: RunRequest, bundle: Bundle, connect) -> LiveRun:
     live.push("", "queued", {"at": dt.datetime.now().strftime("%H:%M:%S"), "cases": len(request.case_ids)})
     threading.Thread(target=_execute, args=(live, bundle, connect), daemon=True, name="loop-run").start()
     return live
+
+
+# ------------------------------------------------------------------ Ask: a user's own question (no gold)
+
+@dataclass
+class AskRun:
+    """One user question answered by the inner loop. There is no gold, so only the self-check decides; the
+    user's thumbs up / down (+ optional corrected SQL) is stored as feedback for the outer loop."""
+    question: str
+    asked_by: str = "local-user"
+    model: str = "glm-4-flash"
+    max_repairs: int = 2
+    few_shot: str = "dynamic"
+    knowledge: bool = True
+    curated: bool = True
+    query_id: str = field(default_factory=lambda: f"q-{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:6]}")
+    events: list[dict] = field(default_factory=list)
+    status: str = "running"
+    error: str | None = None
+    attempts: list[dict] = field(default_factory=list)
+    final_index: int = 0
+    columns: list[str] = field(default_factory=list)
+    rows: list[tuple] = field(default_factory=list)
+    prompt_version: str = ""
+    saved: bool = False
+    started: float = field(default_factory=time.time)
+    finished: float | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def push(self, step: str, payload: dict) -> None:
+        with self._lock:
+            self.events.append({"t": round(time.time() - self.started, 1), "case_id": self.query_id, "step": step,
+                                **payload})
+
+    def snapshot(self) -> list[dict]:
+        with self._lock:
+            return list(self.events)
+
+    @property
+    def elapsed(self) -> float:
+        return round((self.finished or time.time()) - self.started, 1)
+
+    @property
+    def final(self) -> dict:
+        return self.attempts[self.final_index] if self.attempts else {}
+
+
+ASK_ROWS = 1000   # rows shown to the user
+
+
+def _ask(ask: AskRun, bundle: Bundle, connect) -> None:
+    conn = None
+    try:  # everything inside: any failure must end the run as "error", never leave the page polling
+        from agent.llm import UsageMeter, make_client
+        from benchmark.beaver.dataset import AgentTask
+        from dbx import experience
+        from dbx.catalog import Layout
+        from loop_engineer.verifier import SelfVerifier
+
+        conn = connect()
+        db = bundle.config["beaver"]["db"]
+        calls = 1 + 2 * ask.max_repairs + 2
+        inner = make_client(model=ask.model, max_output_tokens=int(bundle.config["llm"]["max_output_tokens"]),
+                            meter=UsageMeter(max_calls=calls, max_tokens=30_000 * calls))
+        controller, generator = build_controller(bundle, inner, conn, "targeted", ask.max_repairs, ask.few_shot,
+                                                 ask.knowledge, ask.curated)
+        ask.prompt_version = generator.prompt_version
+        res = controller.run(AgentTask(case_id=ask.query_id, question=ask.question, db=db), SelfVerifier(),
+                             on_event=ask.push)
+        ask.attempts, ask.final_index = res.attempts, res.final_index
+        fin = ask.final
+        if fin.get("execution_status") == "SUCCESS" and fin.get("generated_sql"):
+            ex = conn.execute(fin["generated_sql"], db, max_rows=ASK_ROWS)   # columns for display
+            ask.columns, ask.rows = list(ex.columns), list(ex.rows)
+        tokens = sum(int(a.get("input_tokens") or 0) + int(a.get("output_tokens") or 0) + int(a.get("diag_tokens") or 0)
+                     for a in res.attempts)
+        latency = sum(int(a.get("llm_latency_ms") or 0) + int(a.get("exec_latency_ms") or 0) for a in res.attempts)
+        experience.save_user_query(conn, Layout(CATALOG), {
+            "query_id": ask.query_id, "asked_by": ask.asked_by, "question": ask.question, "model": inner.model,
+            "prompt_version": ask.prompt_version, "final_sql": fin.get("generated_sql"),
+            "execution_status": fin.get("execution_status"), "verifier_decision": fin.get("verifier_decision"),
+            "result_row_count": fin.get("result_row_count"), "n_attempts": len(res.attempts), "total_tokens": tokens,
+            "latency_ms": latency,
+            "attempts_json": json.dumps(res.attempts, ensure_ascii=False, default=str)[:500_000]})
+        ask.saved = True
+        ask.status = "done"
+    except Exception as e:
+        log.exception("ask failed")
+        ask.status, ask.error = "error", f"{type(e).__name__}: {e}"
+        ask.push("error", {"message": ask.error, "trace": traceback.format_exc()[-2000:]})
+    finally:
+        ask.finished = time.time()
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def start_ask(ask: AskRun, bundle: Bundle, connect) -> AskRun:
+    if not ask.question.strip():
+        raise ValueError("empty question")
+    if ask.model not in MODELS:
+        raise ValueError(f"unknown model {ask.model}")
+    if not 0 <= ask.max_repairs <= MAX_REPAIRS:
+        raise ValueError(f"max_repairs must be 0..{MAX_REPAIRS}")
+    threading.Thread(target=_ask, args=(ask, bundle, connect), daemon=True, name="ask").start()
+    return ask
+
+
+def submit_feedback(ask: AskRun, bundle: Bundle, connect, rating: str, reason: str = "", corrected_sql: str = "",
+                    comment: str = "", user: str = "local-user") -> dict:
+    """Store the user's verdict. A corrected SQL is executed first so the reviewer knows whether it runs
+    (the executor only accepts read-only statements)."""
+    from dbx import experience
+    from dbx.catalog import Layout
+
+    conn = connect()
+    try:
+        status, error = None, None
+        corrected_sql = (corrected_sql or "").strip().rstrip(";").strip()
+        if corrected_sql:
+            ex = conn.execute(corrected_sql, bundle.config["beaver"]["db"], max_rows=10)
+            status, error = ex.status, ex.error
+        fid = experience.save_feedback(conn, Layout(CATALOG), {
+            "query_id": ask.query_id, "rating": rating, "reason": reason or None,
+            "corrected_sql": corrected_sql or None, "corrected_sql_status": status, "comment": comment or None,
+            "question": ask.question, "final_sql": ask.final.get("generated_sql"), "user": user})
+        return {"feedback_id": fid, "corrected_sql_status": status, "error": error}
+    finally:
+        conn.close()

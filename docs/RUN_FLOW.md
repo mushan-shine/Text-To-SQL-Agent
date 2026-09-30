@@ -249,11 +249,50 @@ out.write_text(kb.to_json())                                          # runs/kno
 - 相似表组，以及同类问题在组内的使用比例；
 - 每对表常用的关联键和 INNER / LEFT 比例。
 
-**使用**：生成时 `FewShotGenerator` 调用 `knowledge.notes_for(question, tables)`，取出本题相关的约 10 行，放在 prompt 的 schema 后面（[agent/generator.py](../agent/generator.py) `build_prompt` 的 `notes` 参数）。开关：配置 `knowledge.mode`、命令行 `--knowledge on`、网页"数仓使用说明"。
+**使用**：生成时 `FewShotGenerator` 调用 `knowledge.notes_for(question, tables)`，取出本题相关的 7–13 行（多数 12–13 行，见疑问与价值·疑问 13），放在 prompt 的 schema 后面（[agent/generator.py](../agent/generator.py) `build_prompt` 的 `notes` 参数）。开关：配置 `knowledge.mode`、命令行 `--knowledge on`、网页"数仓使用说明"。
 
 相似题示例库不需要单独构建：用 `--few-shot dynamic` 时，[agent/examples.py](../agent/examples.py) `build_generator_index` 会在运行时从训练集现场建立；网页使用 `app/bundle/examples_pool.json.gz`。
 
-**一次外循环迭代**：阶段 3 或 6 跑开发集 → 阶段 4 用 `analyze_run` 分类错因 → 在训练集上归纳对应的知识 → 回到阶段 3 或 6，对比同一批题的变化 → 写进 EXECUTION_LOG。
+**一次外循环迭代（手工版）**：阶段 3 或 6 跑开发集 → 阶段 4 用 `analyze_run` 分类错因 → 在训练集上归纳对应的知识 → 回到阶段 3 或 6，对比同一批题的变化 → 写进 EXECUTION_LOG。
+
+### 阶段 8b：外循环自动迭代 + 人工审核（产品化）
+
+```bash
+python scripts/outer_loop.py --train-n 6 --dry-run   # 试跑：不写 Delta
+python scripts/outer_loop.py --train-n 60            # 一次迭代：提案写入 experience.proposals
+```
+
+**代码**：[scripts/outer_loop.py](../scripts/outer_loop.py) `main` → [evaluation/outer_loop.py](../evaluation/outer_loop.py)
+
+```python
+current = load_curated(dbx, layout)                       # 已批准、生效中的知识
+sample = ol.sample_training(queries, eval_ids | dev_ids, n, seed)          # ① 训练集抽题
+judge = ol.gold_judge_from_sql(dbx, q["sql"], db, max_rows)                # 在 Databricks 上执行 Gold
+train = ol.run_and_judge(cases, judges, retriever, generator(...), ...)    # ② 生成 + 判分 + 错因标注
+candidates = ol.mine_table_preferences(failures, kb, catalog) \
+           + ol.mine_missing_tables(failures, kb) \
+           + ol.mine_join_rules(failures, kb) \
+           + ol.mine_verified_queries(experience.list_feedback(...), ...)  # ③ 候选（含用户反馈）
+before = ol.run_and_judge(dev, ..., generator(...))                        # ④ 开发集：当前系统
+after  = ol.run_and_judge(dev, ..., generator(..., ol.as_curated(candidates)))  #     当前 + 候选
+regression = ol.compare(before, after)            # 答对不减少、零误伤、token 增幅 ≤ 20%
+experience.save_proposals(dbx, layout, ol.proposal_rows(batch_id, candidates, regression))  # ⑤ pending
+```
+
+- 训练题生成时，相似题示例库会排除这些训练题本身，避免"拿自己的答案当示例"。
+- 候选至少要有 `--min-support 2` 道错题支持；已验证查询来自 👍 的答案或能执行的修正 SQL。
+- 本地同时保存 `runs/outer_loop/<batch_id>/proposals.json`。
+
+**审核与上线**：网页「审核」页（[app/app_pages/review.py](../app/app_pages/review.py)）→ `experience.review_proposal`：批准时把提案状态改为 approved，并插入一条 `experience.knowledge_items`（active）。提问页和运行页在每次运行时调用 `load_curated` + `attach_curated`（[agent/curated.py](../agent/curated.py)），所以**下一次提问就生效**；「已生效知识」里点停用 → `deactivate_item`，下一次提问即不再使用。
+
+**用户提问**：网页「提问」页（[app/app_pages/ask.py](../app/app_pages/ask.py)）→ [app/runner.py](../app/runner.py) `start_ask` → 后台线程 `_ask`：
+
+```python
+controller, generator = build_controller(bundle, inner, conn, "targeted", max_repairs, few_shot, knowledge, curated)
+res = controller.run(AgentTask(case_id=query_id, question=question, db="dw"), SelfVerifier(), on_event=ask.push)
+experience.save_user_query(conn, layout, {...})          # experience.user_queries
+# 用户点 👍 / 👎 后：submit_feedback → 修正 SQL 先只读执行 → experience.save_feedback
+```
 
 ---
 
@@ -280,7 +319,8 @@ load_run → flatten_loop_records（每题每次尝试一行，dbx/publish.py:35
 streamlit run app/streamlit_app.py --server.port 8502
 ```
 
-也可以用预览配置 `loop-console`。页面入口是 [app/streamlit_app.py](../app/streamlit_app.py)，有两页：
+也可以用预览配置 `loop-console`。页面入口是 [app/streamlit_app.py](../app/streamlit_app.py)，有四页：
+- **提问**（默认页）和 **审核**：见阶段 8b；
 - **Loop Debug Console**（[app/dashboard.py](../app/dashboard.py)，数据来自 [app/data.py](../app/data.py) 的 Delta 查询）：总览、对照实验、消融、逐题追踪、失败与诊断；
 - **运行 Loop**：见阶段 6 入口 B。
 
@@ -326,6 +366,7 @@ databricks warehouses start 0e96e1d4ab3f34b0 -p DEFAULT
 |---|---|
 | 跑单元测试 | `python -m pytest -q` |
 | 开发集生成端对比 | `python scripts/phase1.py dev --few-shot dynamic --knowledge on` |
+| 外循环一次迭代（写入待审核提案） | `python scripts/outer_loop.py --train-n 60` |
 | 开发集 Loop（免费模型、前 3 题试跑） | `python scripts/phase6.py --max-repairs 2 --few-shot dynamic --limit 3` |
 | 临时切换到 DeepSeek（花费几分钱到几毛钱） | 命令前加 `LLM_PROVIDER=deepseek` |
 | 分析一次运行的错因 | `python scripts/analyze_run.py <run_id>` |

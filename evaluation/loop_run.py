@@ -32,6 +32,7 @@ def _tokens(a: dict) -> int:
     return int(a.get("input_tokens") or 0) + int(a.get("output_tokens") or 0) + int(a.get("diag_tokens") or 0)
 
 
+# 入口
 def run_arm(cases: list[BeaverCase], judges: dict[str, Callable], controller: LoopController,
             verifier_for: Callable[[str], Any], arm: str, out_root: Path, meta: dict,
             on_event: Callable[[str, str, dict], None] | None = None) -> tuple[str, dict]:

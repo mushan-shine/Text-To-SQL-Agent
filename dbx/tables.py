@@ -80,6 +80,31 @@ RUNS = pa.schema([
     ("mlflow_run_id", S), ("created_at", T),
 ])
 
+# ---- product + outer loop (schema `experience`) -------------------------------------------------
+# A user question answered by the inner loop (no gold exists for it).
+USER_QUERIES = pa.schema([
+    ("query_id", S), ("asked_by", S), ("question", S), ("model", S), ("prompt_version", S),
+    ("final_sql", S), ("execution_status", S), ("verifier_decision", S), ("result_row_count", I),
+    ("n_attempts", I), ("total_tokens", I), ("latency_ms", I), ("attempts_json", S), ("created_at", T),
+])
+# User feedback on an answer: thumbs up / down, reason, optional corrected SQL. A weak label, never gold.
+FEEDBACK = pa.schema([
+    ("feedback_id", S), ("query_id", S), ("rating", S), ("reason", S), ("corrected_sql", S),
+    ("corrected_sql_status", S), ("comment", S), ("question", S), ("final_sql", S), ("user", S),
+    ("created_at", T),
+])
+# Outer-loop proposals waiting for a data engineer's review (pending -> approved / rejected).
+PROPOSALS = pa.schema([
+    ("proposal_id", S), ("batch_id", S), ("kind", S), ("title", S), ("content_json", S), ("evidence_json", S),
+    ("regression_json", S), ("recommendation", S), ("status", S), ("reviewer", S), ("review_note", S),
+    ("created_at", T), ("reviewed_at", T),
+])
+# Approved knowledge the online system uses (active) or no longer uses (inactive = rolled back).
+KNOWLEDGE_ITEMS = pa.schema([
+    ("item_id", S), ("proposal_id", S), ("batch_id", S), ("kind", S), ("content_json", S), ("status", S),
+    ("approved_by", S), ("approved_at", T), ("deactivated_by", S), ("deactivated_at", T),
+])
+
 GOLD_RESULTS = pa.schema([
     ("case_id", S), ("db", S),
     ("gold_sql", S),                # original text, as executed
