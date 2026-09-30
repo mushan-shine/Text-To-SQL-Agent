@@ -163,18 +163,22 @@ class LoopController:
                 nxt.update(self._generic_retry(attempt, tuple(attempt["retrieved_tables"])))
                 details = self._last_details
             else:
+                # 1. 观察
                 obs = observe(attempt, task.db)   # whitelist: nothing gold-derived reaches diagnosis / repair
                 emit("observe", attempt_id=n, fields=list(OBSERVABLE_FIELDS), execution_status=obs.execution_status,
                      error_class=obs.error_class, unresolved_qualifier=obs.unresolved_qualifier,
                      unresolved_column=obs.unresolved_column, suggestions=list(obs.suggestions),
                      missing_table=obs.missing_table, result_row_count=obs.result_row_count,
                      retrieved_tables=len(obs.retrieved_tables), verifier_signals=list(obs.verifier_signals))
+                # 2. 诊断
                 diag, usage = self.diagnoser.diagnose(obs)
                 emit("diagnose", attempt_id=n, failure_type=diag.failure_type, confidence=diag.confidence,
                      reason=diag.reason, source=diag.source, repair_hints=diag.repair_hints,
                      error_class=obs.error_class, unresolved_column=obs.unresolved_column)
+                # 3. 路由
                 route = self.policy.route(diag)
                 emit("route", attempt_id=n, skill=route.skill, fallback=route.fallback, reason=route.reason)
+                # 4. 执行skill
                 res = self.policy.skill(route.skill).repair(obs, diag, self.ctx)
                 attempt.update({"failure_type": diag.failure_type, "diagnosis_confidence": diag.confidence,
                                 "diagnosis_reason": diag.reason, "diagnosis_source": diag.source,
