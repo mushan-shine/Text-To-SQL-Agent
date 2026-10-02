@@ -3,10 +3,12 @@
 > 从一次运行的入口开始，按**代码的调用层级**讲完一道题在 Loop 里的全过程。标题层级与调用层级一致：同一层级的代码段用同一级标题。
 >
 > 每个代码段按同样的顺序讲：
-> 1. **调用位置**：它被哪个文件、哪一行、哪句代码调用；
-> 2. **内部实现**：源码和逐行说明；内部再调用多个函数时，往下一级标题继续拆；
-> 3. **真实数据**：真实运行里的输入输出；
-> 4. **设计原因**：为什么这样做。
+> 1. **功能**：这个函数具体完成什么事；
+> 2. **调用位置**：它被哪个文件、哪一行、哪句代码调用；
+> 3. **函数定义**：签名，以及输入、输出的名称、类型和含义；
+> 4. **内部实现**：源码和逐行说明；内部再调用多个函数时，往下一级标题继续拆；
+> 5. **真实数据**：真实运行里的输入输出；
+> 6. **设计原因**：为什么这样做。
 >
 > 整体架构见 [ARCHITECTURE.md](ARCHITECTURE.md)，类关系与数据流图见 [LOOP_ARCHITECTURE.md](LOOP_ARCHITECTURE.md)，设计取舍见 [LOOP_DESIGN.md](LOOP_DESIGN.md)，模型每次看到什么见 [CONTEXT_DESIGN.md](CONTEXT_DESIGN.md)，实验数据见 [EXECUTION_LOG.md](EXECUTION_LOG.md)。
 >
@@ -86,6 +88,8 @@ evaluation/loop_run.py  run_arm()                       (2)  逐题循环
 
 ### 1.1 命令行：`scripts/phase6.py` `main`
 
+**功能**：命令行入口。读取命令行参数和配置，加载题目、表结构和示例，创建 LLM 客户端和数据库连接，把检索器、生成器、诊断器、路由策略、修复上下文组装成一个 `LoopController`，再交给 `run_arm` 逐题运行；结果写入运行目录，并在终端打印汇总。
+
 **调用位置**
 
 在命令行直接运行：
@@ -149,6 +153,8 @@ run_id, summary = run_arm(cases, judges, controller, verifier_for, arm, Path("ru
 
 ### 1.2 网页：`app/runner.py`
 
+**功能**：网页入口。用户在"运行 Loop"页选好题目和设置后点"执行"，`app/runner.py` 在后台跑完与命令行相同的流程，并把每一步的事件实时推给页面。由三个函数配合完成：`start_run` 启动后台线程，`_execute` 设置预算并运行逐题循环，`build_controller` 组装控制器。
+
 **调用位置**
 
 网页"运行 Loop"页点击"执行"后，[app/app_pages/run_loop.py:117](../app/app_pages/run_loop.py#L117)：
@@ -162,6 +168,8 @@ st.session_state["live"] = runner.start_run(req, B, data.connect)
 <a id="s1-2-1"></a>
 
 #### 1.2.1 `start_run`：在后台线程里运行
+
+**功能**：接收网页提交的运行设置，创建记录实时状态的 `LiveRun` 对象，在后台线程里启动本次运行，然后立即返回。页面因此不会卡住，可以一边运行一边刷新进度。
 
 **调用位置**：[app/app_pages/run_loop.py:117](../app/app_pages/run_loop.py#L117)，网页上点击"执行"后：`runner.start_run(req, B, data.connect)`。
 
@@ -200,6 +208,8 @@ st.fragment(live_panel, run_every=1 if running else None)()
 
 #### 1.2.2 `_execute`：设置调用预算，运行逐题循环
 
+**功能**：后台线程真正执行的函数。加载本次要跑的题和判定函数，按题数和修复次数算出 LLM 调用上限，组装控制器，调用 `run_arm` 逐题运行并把事件推给页面；运行结束后生成分析报告，按设置发布到 Delta，最后把结果和状态（完成 / 出错）写回 `LiveRun`。
+
 **调用位置**：[app/runner.py:300](../app/runner.py#L300)，由 `start_run` 启动的后台线程运行：`threading.Thread(target=_execute, args=(live, bundle, connect), ...)`。
 
 **函数定义**
@@ -234,6 +244,8 @@ run_id, summary = run_arm(cases, judges, controller, verifier_for, arm, _out_roo
 
 #### 1.2.3 `build_controller`：组装
 
+**功能**：按运行设置把各部件组装成 `LoopController`：给 LLM 客户端加缓存层，按示例方式创建生成器，按开关加载数仓使用说明和审核通过的知识，再把检索器、执行器、诊断器、路由策略和修复上下文注入控制器。运行页和提问页共用它，保证两处的 Loop 完全一样。
+
 **调用位置**：[app/runner.py:252](../app/runner.py#L252)，在 `_execute` 里；提问页的 `_ask` 也调用它（[app/runner.py:366](../app/runner.py#L366)）。
 
 **函数定义**
@@ -265,6 +277,8 @@ def build_controller(bundle: Bundle, inner: Any, conn: Any, strategy: str, max_r
 <a id="s2"></a>
 
 ## 2. 逐题循环：`run_arm`
+
+**功能**：对一批题目逐题运行 Loop 并判分。每道题只把题面交给 Loop，Loop 返回之后再用 Gold 判断每次尝试是否答对，写成一行记录；全部跑完后计算恢复率、误伤率等指标，生成运行编号和汇总，写入运行目录。
 
 **调用位置**
 
@@ -317,6 +331,8 @@ summary = {"run_id": run_id, "arm": arm, **summarize(records)}                  
 
 ### 2.1 只把题面交给 Loop：`agent_view`
 
+**功能**：把一道完整的题目记录（含 Gold SQL 和各种标注）裁剪成只有题号、问题、库名的 `AgentTask`。这是 Loop 唯一能拿到的输入，从源头保证 Loop 看不到答案。
+
 **调用位置**：[loop_run.py:53](../evaluation/loop_run.py#L53)，作为 `controller.run` 的第一个参数。
 
 **函数定义**
@@ -343,6 +359,8 @@ def agent_view(self) -> AgentTask:
 
 ### 2.2 运行单题 Loop：`controller.run`
 
+**功能**：对一道题运行完整的内循环：检索候选表、生成 SQL，然后反复执行、自检、诊断、修复，直到自检通过或次数用完，返回所有尝试和最终答案。
+
 **调用位置**：[loop_run.py:53](../evaluation/loop_run.py#L53)。
 
 **内部实现**：见[第 3 节](#s3)。
@@ -350,6 +368,8 @@ def agent_view(self) -> AgentTask:
 <a id="s2-3"></a>
 
 ### 2.3 Loop 结束后判分
+
+**功能**：Loop 返回之后，用这道题的判定函数把每次能执行的尝试的结果与 Gold 结果比较，得出每次尝试是否答对，以及首次、最终是否答对。判分结果只用于评测，不回流给 Loop。
 
 **调用位置**：[loop_run.py:54](../evaluation/loop_run.py#L54)，紧跟在 `controller.run` 返回之后。
 
@@ -373,6 +393,8 @@ Judge = Callable[[list], tuple[bool, str]]      # evaluation/baseline.py:45（�
 <a id="s2-4"></a>
 
 ### 2.4 指标汇总：`summarize`
+
+**功能**：把所有题目的逐题记录汇总成一次运行的指标：首次和最终的答对数、可执行数，恢复率、误伤率、净收益，自检的混淆矩阵，每个技能的使用次数和效果，以及 token 和耗时成本。
 
 **调用位置**：`run_arm` 末尾，全部题目跑完之后。
 
@@ -412,6 +434,8 @@ def summarize(records: list[dict]) -> dict[str, Any]:      # evaluation/loop_run
 <a id="s3"></a>
 
 ## 3. 单题 Loop：`LoopController.run`
+
+**功能**：内循环的主体，对一道题完成"生成 → 自检 → 诊断 → 修复"的闭环：先检索候选表、生成第一版 SQL；然后每一轮执行 SQL 并自检，不通过就观察失败现象、诊断失败类型、路由到对应技能修复，得到新的 SQL 进入下一轮；循环结束后从所有尝试中选出最终答案。全程只依赖题面和运行时可观察的信息，不接触 Gold。
 
 **调用位置**
 
@@ -463,6 +487,8 @@ return LoopResult(attempts, all_rows, final)                              # :213
 
 ### 3.1 检索：`retriever.retrieve`
 
+**功能**：从数仓 97 张表中挑出和问题最相关的候选表：用 BM25 按问题文本给每张表打分，返回分数最高的前 20 张及其分数，作为生成 SQL 时给模型看的 schema 范围。
+
 **调用位置**：[controller.py:117](../loop_engineer/controller.py#L117)
 
 ```python
@@ -489,6 +515,8 @@ def retrieve(self, question: str, k: int = 10) -> Retrieval:      # agent/retrie
 <a id="s3-2"></a>
 
 ### 3.2 生成：`generator.generate`
+
+**功能**：根据问题和候选表生成第一版 SQL：挑选示例（固定示例或相似题示例），补充示例和审核知识里用到的表，拼出包含规则、schema、说明、示例和问题的 prompt，调用 LLM，再从回复中抽取 SQL。
 
 **调用位置**：[controller.py:120](../loop_engineer/controller.py#L120)
 
@@ -549,6 +577,8 @@ r = self.client.complete(prompt, system=SYSTEM)                 # :180，经过�
 
 ### 3.3 循环体：执行、自检、修复
 
+**功能**：内循环中重复的部分。每一轮执行当前 SQL 并自检；通过或次数用完就结束，否则依次观察、诊断、路由、修复，生成下一次尝试的 SQL。
+
 **调用位置**：[controller.py:139](../loop_engineer/controller.py#L139)
 
 ```python
@@ -560,6 +590,8 @@ for n in range(1, self.cfg.max_attempts + 1):     # max_attempts = 最大修复�
 <a id="s3-3-1"></a>
 
 #### 3.3.1 执行：`_execute`
+
+**功能**：在 Databricks 上执行当前 SQL，返回两部分：写进尝试记录的执行摘要（状态、报错、行数、前 5 行预览、耗时），以及单独保存的完整结果行。模型没给出 SQL 时不执行，直接沿用抽取 SQL 时的状态。
 
 **调用位置**：[controller.py:141](../loop_engineer/controller.py#L141)
 
@@ -611,6 +643,8 @@ execution_error : [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column ... with name `at
 <a id="s3-3-2"></a>
 
 #### 3.3.2 自检：`verifier.verify`
+
+**功能**：在没有 Gold 的情况下判断这次尝试是否可疑：先看执行状态（没有 SQL、报错、结果过大、空结果、整列 NULL），能执行时再检查 SQL 结构和结果数值是否自相矛盾。返回是否通过、触发不通过的信号，以及每个问题的证据和修复提示。
 
 **调用位置**：[controller.py:144](../loop_engineer/controller.py#L144)
 
@@ -672,6 +706,8 @@ return VerifierDecision(not hits, self.mode, tuple(hits), tuple(findings), tuple
 
 #### 3.3.3 终止判断
 
+**功能**：决定是否结束循环：先把本次尝试和结果行存下来，自检通过或已达最大尝试次数就退出；否则继续往下诊断和修复。
+
 **调用位置**：[controller.py:156](../loop_engineer/controller.py#L156)，紧跟在自检之后。
 
 **函数定义**：这是 `LoopController.run` 内部的代码，不是独立函数；用到的变量都是 `run` 的局部变量。
@@ -690,6 +726,8 @@ if decision.passed or n == self.cfg.max_attempts:
 <a id="s3-3-4"></a>
 
 #### 3.3.4 观察：`observe`
+
+**功能**：把一次尝试的记录转换成诊断可用的观察结果：只按白名单保留 12 个运行时可见的字段，并从 Databricks 报错文本中解析出错误类别、找不到的列和它的别名、数据库给出的候选列、不存在的表名。
 
 **调用位置**：[controller.py:169](../loop_engineer/controller.py#L169)
 
@@ -732,6 +770,8 @@ def observe(record, db):
 <a id="s3-3-5"></a>
 
 #### 3.3.5 诊断：`diagnoser.diagnose`
+
+**功能**：根据观察结果判断失败属于哪一类（选表、列映射、关联键、查询拆解、领域知识、执行错误），给出置信度、原因，以及交给修复技能的证据（如这一列实际在哪些表里）。先用规则判断，规则判断不了再调用 LLM。
 
 **调用位置**：[controller.py:176](../loop_engineer/controller.py#L176)
 
@@ -799,6 +839,8 @@ glm 那次运行共 27 次诊断，26 次由规则完成。
 
 #### 3.3.6 路由：`policy.route`
 
+**功能**：根据诊断出的失败类型选出负责修复的技能：查"失败类型 → 技能"映射表得到技能名，被禁用的技能退回 RepairSQL；再由 `skill(name)` 按名字取出技能对象，供下一步调用。
+
 **调用位置**：[controller.py:181](../loop_engineer/controller.py#L181)
 
 ```python
@@ -842,6 +884,8 @@ def route(self, diagnosis):
 
 #### 3.3.7 修复：`skill.repair`
 
+**功能**：由路由选出的技能修复 SQL，返回修复后的 SQL 和修复过程。每个技能针对一类失败：先做不需要 LLM 的确定性工作（如改正列的别名、查出要补的表和关联键），解决不了的部分再带着定向指令调用一次 LLM。
+
 **调用位置**：[controller.py:184](../loop_engineer/controller.py#L184)
 
 ```python
@@ -853,6 +897,8 @@ res = self.policy.skill(route.skill).repair(obs, diag, self.ctx)
 **内部实现**：5 个技能实现同一个接口，各自先做不需要 LLM 的工作，需要时再调一次 LLM。下面先讲公共部分，再讲各技能。
 
 ##### 公共部分：接口、上下文、修复模板
+
+**功能**：所有技能共享的部分：统一的 `repair` 接口，技能可用的资源 `RepairContext`，统一的返回结构 `RepairResult`，以及需要 LLM 时共用的修复模板和调用函数 `llm_repair`；`observed_text` 负责把报错或自检发现的问题写成 prompt 里的一段文字。
 
 **调用位置**：[controller.py:184](../loop_engineer/controller.py#L184)：`self.policy.skill(route.skill).repair(obs, diag, self.ctx)`，路由选出的技能对象被调用 `repair`。
 
@@ -909,6 +955,8 @@ Return the corrected query as ONE read-only SQL query inside a ```sql code fence
 
 ##### SchemaSearch（列映射）
 
+**功能**：修复"列挂错了表或别名"。先逐个检查 SQL 里带别名的列，能唯一确定正确表的直接改过去；会让关联条件失效的改动撤回；剩下改不了的部分，连同候选列和候选关联键交给 LLM。
+
 **调用位置**：诊断为列映射（`COLUMN_MAPPING_FAILURE`）时，3.3.7 的 `repair` 调用落到 `SKILLS["SchemaSearch"]`。
 
 **函数定义**
@@ -943,6 +991,8 @@ return llm_repair(self.name, start, diagnosis, ctx, [...], instruction, action,
 
 ##### RetrieveAgain（选表）
 
+**功能**：修复"少用了表"或"用了不存在的表"。直接使用诊断找到的、真正包含该列的表，从 schema 推断这些表怎么关联到 SQL 已用的表上，再让 LLM 把它们加进查询；表不存在时，改为找名字相近的真实表。
+
 **调用位置**：诊断为选表（`TABLE_RETRIEVAL_FAILURE`）时，3.3.7 的 `repair` 调用落到 `SKILLS["RetrieveAgain"]`。
 
 **函数定义**
@@ -967,6 +1017,8 @@ instruction = f"Column {h.get('column')} is not in the table you used; it lives 
 
 ##### 其他技能
 
+**功能**：其余三个技能分别处理关联键错误、查询结构错误和执行报错（以及兜底），做法见下表。
+
 | 技能 | 处理 | 做法 |
 |---|---|---|
 | FindJoinPath | 关联键 | 列出 SQL 已用各表之间共享的键列，要求逐个核对 JOIN ON |
@@ -978,6 +1030,8 @@ instruction = f"Column {h.get('column')} is not in the table you used; it lives 
 <a id="s3-3-8"></a>
 
 #### 3.3.8 状态交接：写回诊断，组装下一次尝试
+
+**功能**：把这一轮的诊断和修复写进尝试记录，并组装下一次尝试：诊断结果写在失败的那次尝试上，修复后的 SQL 和技能信息写在新的尝试上，两条记录互相指向；然后用新的尝试进入下一轮。
 
 **调用位置**：[controller.py:159](../loop_engineer/controller.py#L159) 起，修复完成后、进入下一轮之前。
 
@@ -1004,6 +1058,8 @@ attempt = nxt                                      # :203，回到 3.3.1
 
 ### 3.4 选出最终答案
 
+**功能**：循环结束后，从所有尝试中选出作为最终答案的一次：优先选最后一个自检通过的，其次选最后一个能执行的，都没有就选最后一次；标记每次尝试是否为最终答案，返回 `LoopResult`。
+
 **调用位置**：[controller.py:204](../loop_engineer/controller.py#L204)，循环结束之后。
 
 **函数定义**：这是 `LoopController.run` 内部的代码，不是独立函数；用到的变量都是 `run` 的局部变量。
@@ -1025,6 +1081,8 @@ final = passed[-1] if passed else executed[-1] if executed else len(attempts) - 
 <a id="s4"></a>
 
 ## 4. 发布、回放与分析
+
+**功能**：运行结束后的处理：把逐次尝试的记录展平写入 Delta 和 MLflow，供看板回放每道题的完整过程；网页运行还会根据事件自动生成分析报告；另有脚本把运行结果逐题与 Gold 对照，做错误分析。
 
 **调用位置**：运行结束之后。命令行运行需要手动发布；网页运行默认自动发布。
 

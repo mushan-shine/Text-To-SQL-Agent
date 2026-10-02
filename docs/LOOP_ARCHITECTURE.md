@@ -201,6 +201,35 @@ classDiagram
 
 > `Verifier` 和 `RepairSkill` 是"约定的接口"：代码里 `RepairSkill` 是 `typing.Protocol`（[skills/base.py:47](../skills/base.py#L47)）；自检器没有显式接口类，两个实现都提供 `verify(attempt, rows)`，控制器只依赖这个方法。
 
+### 2.1 各类方法的功能
+
+| 类 | 方法 | 功能 |
+|---|---|---|
+| `LoopController` | `run(task, verifier, on_event)` | 编排一道题的完整闭环：检索 → 生成 → 循环（执行 → 自检 → 观察 → 诊断 → 路由 → 修复）→ 选出最终答案；逐步推送事件，返回 `LoopResult` |
+| `LoopController` | `_execute(sql, db, parse_status)` | 执行一条 SQL，返回并入尝试记录的执行摘要（状态、报错、行数、前 5 行预览、耗时）和单独保存的完整结果行；没有 SQL 时不执行 |
+| `LoopResult` | `final` | 返回被选为最终答案的那次尝试记录 |
+| `SchemaCatalog` | `from_databricks()` / `from_json()` | 从 Databricks 元数据或已保存的 JSON 构建表结构目录（表名、列名、类型、样例值），供检索、生成、诊断、修复共用 |
+| `BM25TableRetriever` | `score(question)` | 用 BM25 给每张表算出与问题的相关分数 |
+| `BM25TableRetriever` | `retrieve(question, k)` | 按分数取前 k 张表（控制器传 20），返回候选表和分数 |
+| `FewShotGenerator` | `generate(task, tables)` | 挑选示例、补充示例和审核知识里用到的表，拼出 prompt 调用 LLM，从回复中抽取第一版 SQL |
+| `FewShotGenerator` | `prompt_version` | 返回当前 prompt 的版本号：基础版本（固定示例或相似题示例）加上 `+kb`（使用说明）、`+cur`（审核知识）后缀，写进运行元数据 |
+| `DatabricksSqlExecutor` | `execute(sql, db, max_rows)` | 只读检查后在 Databricks 上执行 SQL；超过行数上限返回 `TOO_MANY_ROWS`，出错时提取错误类别 |
+| `SelfVerifier` | `verify(attempt, rows)` | 不看 Gold，根据执行状态、SQL 结构和结果数值判断这次尝试是否可疑，返回是否通过、触发的信号和修复提示 |
+| `OracleVerifier` | `verify(attempt, rows)` | 用 Gold 判断对错，只用于估算上界，结果单独标注 |
+| `Diagnoser` | `diagnose(obs)` | 判断失败类型（选表、列映射、关联键、查询拆解、领域知识、执行错误），给出置信度、原因和修复线索；先用规则，规则没有结论才调 LLM |
+| `Policy` | `route(diagnosis)` | 按"失败类型 → 技能"映射表选出技能名；被禁用的技能退回 RepairSQL，并标明是否为临时替代 |
+| `Policy` | `skill(name)` | 按名字从注册表 `SKILLS` 取出技能对象 |
+| `RepairSkill` | `repair(obs, diagnosis, ctx)` | 修复一类失败：先做不需要 LLM 的确定性工作，解决不了的部分再带定向指令调用一次 LLM，返回新 SQL 和修复过程 |
+| `SchemaSearch` | `repair` | 修复列挂错表或别名：能唯一确定正确表的列直接改，撤回会让关联条件失效的改动，剩下的连同候选列、候选关联键交给 LLM |
+| `RetrieveAgain` | `repair` | 修复少用了表或表不存在：把诊断找到的、包含该列的表和候选关联条件交给 LLM；表不存在时提供名字相近的真实表 |
+| `FindJoinPath` | `repair` | 修复关联键错误：列出 SQL 已用各表之间共享的键列，要求逐条核对 JOIN ON |
+| `ReplanQuery` | `repair` | 修复查询结构错误：让模型先拆子问题，每个写成一个 CTE，再逐项核对输出列、筛选、分组、排序 |
+| `RepairSQL` | `repair` | 修复执行报错（也是兜底）：带上报错信息做最小改动，附上 Databricks 语法注意事项 |
+| `RepairContext` | — | 不含方法，是技能共享的资源包：表结构目录、LLM 客户端、示例、修复 prompt 最多展示的表数 |
+| `CachingChatClient` | `complete(prompt, system)` | 所有 LLM 调用的入口：按（模型, 参数, system, prompt）指纹查缓存，命中就重放，未命中才调用内层客户端（计入调用预算） |
+
+图外还有两个函数也在 Loop 内部被调用：`observe(attempt, db)`（[observer.py:59](../loop_engineer/observer.py#L59)）按白名单从尝试记录中取字段，并从报错文本中解析出错误类别、找不到的列、候选列、不存在的表；`diagnose_by_rules(obs, catalog)`（[diagnose.py:83](../loop_engineer/diagnose.py#L83)）是诊断的规则部分，判断不了返回 `None`。
+
 ---
 
 ## 3. 类之间的关系
@@ -347,6 +376,16 @@ flowchart LR
 ---
 
 ## 6. 装配：三个入口如何组装同一个 Loop
+
+入口函数的功能：
+
+| 函数 | 位置 | 功能 |
+|---|---|---|
+| `main` | [scripts/phase6.py:42](../scripts/phase6.py#L42) | 命令行评测入口：读参数和配置，组装控制器，调用 `run_arm` 跑一批题，结果写入运行目录 |
+| `build_controller` | [app/runner.py:193](../app/runner.py#L193) | 按运行设置组装 `LoopController`：给 LLM 客户端加缓存，创建生成器，按开关加载使用说明和审核知识，注入其余组件；网页两个入口共用 |
+| `_execute` | [app/runner.py:234](../app/runner.py#L234) | 网页"运行 Loop"的后台线程：设置调用预算，组装控制器，调用 `run_arm` 并把事件推给页面，结束后生成分析报告、按设置发布到 Delta |
+| `_ask` | [app/runner.py:352](../app/runner.py#L352) | 网页"提问"的后台线程：组装控制器，用 `SelfVerifier` 对用户问题运行一次 Loop，取回最终 SQL 的结果，存进 `experience.user_queries` 等待用户反馈 |
+| `run_arm` | [evaluation/loop_run.py:36](../evaluation/loop_run.py#L36) | 逐题运行 Loop：只把题面交给 Loop，Loop 返回后再用 Gold 判分，写逐题记录；全部跑完后汇总指标 |
 
 | 入口 | 装配位置 | 自检器 | 事件接收者 | 结束后 |
 |---|---|---|---|---|

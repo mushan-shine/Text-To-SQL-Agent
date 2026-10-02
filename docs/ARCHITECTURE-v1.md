@@ -139,6 +139,21 @@ flowchart TB
 | `evaluator.py` 比较 | 官方口径：按结果集比较，不比 SQL 文本，列顺序算数。跨引擎比较只放宽数值表示差异：DECIMAL 按各自精度比较，浮点相对误差 1e-6，大结果集分桶匹配 |
 | 冻结 Gold | 之后的判分只读冻结的结果，不依赖 MySQL，可复现，也不会因为重新计算而悄悄变化 |
 
+**主要函数的功能**
+
+| 函数 | 位置 | 功能 |
+|---|---|---|
+| `map_column` | `benchmark/beaver/replicate.py` | 把一个 MySQL 列映射成 Databricks 列：确定目标类型，`_ci` 排序规则映射为 `UTF8_LCASE` |
+| `write_parquet` / `insert_from_parquet_sql` | `benchmark/beaver/replicate.py` | 把 MySQL 表数据按列映射写成 parquet，再生成从 staging volume 导入 Delta 的 SQL |
+| `profile_sql` / `compare_profiles` | `benchmark/beaver/replicate.py` | 在两个引擎上各算一份列画像并逐列比较，核对复制是否忠实 |
+| `run_repeated` | `benchmark/beaver/compatibility.py` | 同一条 SQL 在一个引擎上重复执行多次，判断结果是否稳定 |
+| `classify_error` / `static_hazards` | `benchmark/beaver/compatibility.py` | 把执行报错归入几类兼容性问题；从 SQL 文本中静态找出可能导致结果不稳定的写法 |
+| `validate_case` | `benchmark/beaver/compatibility.py` | 对一道题：Gold SQL 在 MySQL 和 Databricks 上各跑一遍，比较结果，产出兼容性记录 |
+| `apply_rules` / `try_adapt` | `benchmark/beaver/adapter.py` | `apply_rules` 对 Gold SQL 应用两条适配规则，返回改写后的 SQL；`try_adapt` 对不一致的题尝试适配，并验证改写后的结果与 MySQL 一致 |
+| `official_match` | `benchmark/beaver/evaluator.py` | BEAVER 官方口径：按结果集比较，不比 SQL 文本 |
+| `cross_engine_match` | `benchmark/beaver/evaluator.py` | 跨引擎比较两份结果，只放宽数值表示差异（DECIMAL 精度、浮点相对误差） |
+| `evaluate_against_gold` | `benchmark/beaver/evaluator.py` | 拿生成 SQL 的结果和冻结的 Gold 结果比较，返回是否答对和原因 |
+
 **结果**：严格比较只有 37/100 一致，查出三类方言差异（数值的表示精度不同、统计函数的口径不同、排名类窗口函数上的 frame 子句）后补上两条规则（规则一：VARIANCE/STD/STDDEV → VAR_POP/STDDEV_POP；规则二：删掉 frame 子句），**最终 89 道可用**（原样 46 + 适配 43）。
 
 ---
@@ -151,6 +166,16 @@ flowchart TB
 | `execution/mysql.py` | MySQL 参照引擎 | 和 Databricks 执行器接口相同，两个引擎可以互换比较 |
 | `dbx/catalog.py` | Catalog 布局、写 Delta | 一个 catalog、5 个 schema，按**权限边界**划分：`benchmark`（Gold）、`dw`（数仓表）、`traces`（Agent 可见）、`evaluation`（判分结果）、`experience`（知识库，预留）；先写 parquet 到 staging volume，再 `INSERT ... BY NAME` |
 | `dbx/tables.py` | 所有 Delta 表的 Arrow schema | 字段定义只在一个地方维护 |
+
+**主要函数的功能**
+
+| 函数 | 位置 | 功能 |
+|---|---|---|
+| `DatabricksSqlExecutor.execute` | `execution/databricks_sql.py` | 只读检查后执行一条 SQL，返回统一的 `ExecutionResult`（状态、结果行、报错、错误类别、耗时）；超过行数上限返回 `TOO_MANY_ROWS` |
+| `extract_error_class` | `execution/databricks_sql.py` | 从 Databricks 报错文本中抽出错误类别，如 `UNRESOLVED_COLUMN` |
+| `MySqlExecutor.execute` / `iter_table` | `execution/mysql.py` | 在 MySQL 参照库上执行 SQL（接口与 Databricks 执行器相同）；按批读取整张表，供复制使用 |
+| `ensure_layout` | `dbx/catalog.py` | 确保项目 catalog 和 5 个 schema 存在，返回布局对象 `Layout` |
+| `write_rows` | `dbx/catalog.py` | 把一批记录按 Arrow schema 转成 parquet，上传到 staging volume，再 `INSERT ... BY NAME` 写入 Delta 表 |
 
 **设计要点**：
 - **执行器是 Loop 的"传感器"**：Databricks 的报错是结构化的，包括错误类别、找不到的列、"Did you mean" 候选。这是后面规则诊断不需要调用 LLM 的前提。
@@ -178,6 +203,19 @@ flowchart TB
 | `knowledge.py` 数仓使用说明 | 从训练集统计三类约定：概念 → 常用表（IDF 加权）、相似表组（列名相似度 ≥ 0.5）在同类问题里的使用比例、每对表常用的关联键和 INNER / LEFT 比例。每题只取相关的 7–13 行（开发集实测，多数 12–13 行） |
 | `llm.py` LLM 客户端 | 一个 OpenAI 兼容客户端，按配置切换智谱和 DeepSeek。**贪心解码 + prompt 指纹缓存**：同一个 prompt 永远拿到同一个回答，同一配置重跑时结果逐字相同，实验可复现，也省钱。`UsageMeter` 限制调用次数和 token；key 只从 `.env` 或 secret 读取 |
 | `join_graph.py`、`sql_analysis.py` | 从 schema 推断候选关联键；用 sqlglot 解析 SQL，把别名还原成真实表名。供诊断和修复技能使用 |
+
+**主要函数的功能**
+
+| 函数 | 位置 | 功能 |
+|---|---|---|
+| `BM25TableRetriever.retrieve` | `agent/retriever.py` | 用 BM25 按问题文本给 97 张表打分，返回最相关的前 20 张候选表及分数 |
+| `FewShotGenerator.generate` | `agent/generator.py` | 挑选示例，补充示例和审核知识里用到的表，拼出 prompt 调用 LLM，从回复中抽取 SQL |
+| `ExampleIndex.build` / `top` | `agent/examples.py` | `build` 用训练集已解题建示例库（排除评测集和开发集）；`top` 按问题文本取最相似的 k 道题 |
+| `WarehouseKnowledge.build` / `notes_for` | `agent/knowledge.py` | `build` 从训练集统计用表约定、相似表组和关联约定；`notes_for` 为一道题挑出相关的几行说明写进 prompt |
+| `make_client` | `agent/llm.py` | 按模型名创建 OpenAI 兼容客户端（智谱或 DeepSeek），挂上调用预算 `UsageMeter` |
+| `CachingChatClient.complete` | `agent/llm.py` | 所有 LLM 调用的入口：按 prompt 指纹查缓存，命中就重放，未命中才真正调用 |
+| `join_candidates` / `connect` | `agent/join_graph.py` | 只根据 schema 推断关联键：列出一组表之间的候选关联；找出一张新表接到已用表上的方式 |
+| `sql_facts` / `alias_map` | `agent/sql_analysis.py` | 解析 SQL 语法树：`sql_facts` 提取用了哪些表、列、关联、运算；`alias_map` 给出“别名 → 表名”对应关系 |
 
 **数据**（开发集 30 题，只生成一次、不修复）：
 
@@ -210,6 +248,21 @@ flowchart TB
 | `diagnose.py` 诊断 | 信号 + schema → 失败类型、置信度、证据 | **规则优先**：报错里已有答案时只做一次 schema 查找（列在已用的表里 → 挂错别名；在检索到但没用的表里 → 选表……）；自检发现的语义问题按映射表归类；只有 SQL 能跑但结果可疑时才调用 LLM。`repair_hints` 把证据原样传给技能 |
 | `policy.py` 路由 | 失败类型 → 技能 | **映射写成数据**：消融只需换表或禁用技能，不改代码；兜底路由会记录在 trace 里 |
 | `skills/` 修复技能 | 观察 + 诊断 + 修复上下文 → 新 SQL + 修复过程记录 | 5 个技能实现同一个接口 `repair(观察, 诊断, 上下文)`，由路由按失败类型选择。每个技能分两步：**① 先做不需要 LLM 的工作**：根据诊断给出的证据整理定向信息，能确定性修好的直接修好、不再调 LLM（如 SchemaSearch 按表结构把挂错别名的列改到正确的表，并检查改完后关联条件不会变成 `x = x`）；**② 需要时再调一次 LLM 改写 SQL**：所有技能共用一个修复模板（规则 + schema + 问题 + 上次的 SQL + 报错或自检发现 + 诊断），区别只在各自写的**定向指令**和**给出的表**。技能不执行 SQL，新 SQL 由控制器在下一轮执行和自检；`details` 记录技能内部的每个决定（确定性修改、候选列、候选关联键、给 LLM 的指令和 prompt），供网页展示；技能不能导入 benchmark / evaluation（测试强制），拿不到标准答案 |
+
+**主要函数的功能**
+
+| 函数 | 位置 | 功能 |
+|---|---|---|
+| `LoopController.run` | `loop_engineer/controller.py` | 编排一道题的闭环：检索 → 生成 → 循环（执行 → 自检 → 观察 → 诊断 → 路由 → 修复）→ 选出最终答案，返回所有尝试和最终答案 |
+| `LoopController._execute` | `loop_engineer/controller.py` | 执行一条 SQL，返回并入尝试记录的执行摘要和单独保存的完整结果行 |
+| `SelfVerifier.verify` | `loop_engineer/verifier.py` | 不看 Gold，根据执行状态、SQL 结构和结果数值判断这次尝试是否可疑，返回是否通过、触发的信号和修复提示 |
+| `check_static` / `check_numeric` | `loop_engineer/checks.py` | `check_static` 解析 SQL、对照题干做结构检查；`check_numeric` 把输出列对应到统计函数，用代码核对数值是否自相矛盾 |
+| `observe` | `loop_engineer/observer.py` | 按白名单从尝试记录中取 12 个可见字段，并从报错文本解析出错误类别、找不到的列、候选列、缺失的表 |
+| `diagnose_by_rules` / `Diagnoser.diagnose` | `loop_engineer/diagnose.py` | 判断失败类型，给出置信度、原因和修复线索 `repair_hints`；先用规则，规则没有结论才调 LLM |
+| `Policy.route` / `Policy.skill` | `loop_engineer/policy.py` | `route` 按“失败类型 → 技能”映射表选出技能名（被禁用的退回 RepairSQL）；`skill` 按名字取出技能对象 |
+| `repair`（5 个技能） | `skills/*.py` | 修复一类失败：先做不需要 LLM 的确定性工作，解决不了的部分再带定向指令调用一次 LLM，返回新 SQL 和修复过程 |
+| `fix_column_refs` | `skills/schema_search.py` | SchemaSearch 的确定性部分：把挂错别名的列改到同一作用域里唯一拥有它的表，并撤回会让关联条件变成 `x = x` 的改动 |
+| `llm_repair` | `skills/base.py` | 用统一的修复模板（规则 + schema + 问题 + 上次 SQL + 报错或自检发现 + 诊断 + 定向指令）调用 LLM，并抽取新 SQL |
 
 #### 从自检信号到修复：信号 → 失败类型 → 技能
 
@@ -270,6 +323,14 @@ flowchart TB
 | `scripts/verifier_eval.py`、`judge_eval.py`、`validator_eval.py` 方法评估 | 每个候选自检方法都测**抓错率**（在能执行但答错的尝试上）和**误报率**（在正确答案和 Gold SQL 上），数据决定"触发修复 / 只作提示 / 不用" |
 | `loop_engineer/judge.py`、`validators.py` | LLM 裁判、查数据库的验证器（过滤值存在性、关联放大）。已经评估过，代码保留，目前只作提示 |
 
+**主要函数的功能**
+
+| 函数 | 位置 | 功能 |
+|---|---|---|
+| `main` | `scripts/analyze_run.py` | 拉取一次运行的结果，最终答案和 Gold 逐题对照（用表、列、关联键、字面值、统计运算、行数、列数），输出主因分布 |
+| `LlmJudge.judge` | `loop_engineer/judge.py` | 让 LLM 判断“这条 SQL 和结果是否回答了问题”，返回判断、置信度和理由 |
+| `ValidatorAgent.validate` | `loop_engineer/validators.py` | 查数据库做两项验证：过滤用的字面值在列里是否存在（`filter_values`）、关联是否让行数异常放大（`join_fanout`） |
+
 **为什么不能把开发集错题的原因直接交给 Loop**：错因是拿 Gold 比出来的。交给 Loop 等于看答案改考卷，生产环境做不到，开发集也会失去衡量作用。正确的做法是**从训练集学通用知识、在开发集上衡量**。
 
 **数据**（四轮自检实验的结论，以及错误分类）：
@@ -318,6 +379,23 @@ flowchart TB
 | `agent/curated.py` | 运行时读取 active 条目：选表偏好、补表提示（同时把表加进 schema）、关联规则按"本题 schema 里有相关表（和关键词）"放进 prompt，排在统计说明之前；已验证查询加入相似题示例库 |
 | `app/app_pages/review.py` | 审核页：按批次展示提案、证据和每条自己的回归结果；批准 / 驳回（可用 `SHT_REVIEWERS` 限定审核人）；已生效知识可一键停用；用户反馈与审核记录 |
 
+**主要函数的功能**
+
+| 函数 | 位置 | 功能 |
+|---|---|---|
+| `sample_training` / `judged_cases` | `evaluation/outer_loop.py` | 从训练集抽题（排除评测集和开发集），并在 Databricks 上算出每题的 Gold 结果作为判分依据 |
+| `run_and_judge` | `evaluation/outer_loop.py` | 用当前系统（或加上候选知识后的系统）生成 SQL、执行并判分，返回每题结果；prompt 没变的题直接复用上次结果 |
+| `mine_table_preferences` / `mine_missing_tables` / `mine_join_rules` | `evaluation/outer_loop.py` | 从错题中归纳三类候选知识：选表偏好（错用了相似表）、补表提示（漏掉的表）、关联规则（漏掉的关联键），每条附支持度和证据 |
+| `mine_verified_queries` | `evaluation/outer_loop.py` | 从用户反馈中挑出点赞的答案，以及点踩时提供的、能执行的修正 SQL，作为“已验证查询”候选（由审核人决定） |
+| `resolve_conflicts` | `evaluation/outer_loop.py` | 处理相反的选表偏好（“用 Y 不用 X”与“用 X 不用 Y”）：支持度至少是对方 2 倍的保留，否则两条都丢弃并记录 |
+| `compare` / `recommendation` | `evaluation/outer_loop.py` | 比较加入候选前后的结果（答对数、误伤、token 增幅），据此给出批准 / 中性 / 驳回建议 |
+| `gate_candidates` | `evaluation/outer_loop.py` | 逐条回归门禁：每条候选单独加入系统，在验证集上与当前系统比较 |
+| `proposal_rows` | `evaluation/outer_loop.py` | 把候选、证据、回归结果和本批信息整理成提案行，写入 `experience.proposals` |
+| `save_user_query` / `save_feedback` | `dbx/experience.py` | 保存用户问题和每次尝试；保存 👍 / 👎、原因和修正 SQL |
+| `review_proposal` / `deactivate_item` | `dbx/experience.py` | 审核：批准时更新提案状态并插入一条 active 知识，驳回只改状态；停用把知识状态改为 inactive，不删数据 |
+| `load_curated` / `attach_curated` | `agent/curated.py` | 读取所有 active 知识，挂到生成器上 |
+| `CuratedKnowledge.notes_for` / `extra_tables` | `agent/curated.py` | 为一道题挑出相关的知识写进 prompt；按补表提示把相关表加进 schema |
+
 **为什么这样设计**：
 - **用户问题没有 Gold**，所以不能直接拿来"学答案"；👍 / 修正 SQL 只是弱标签，要经过人审核才能进入示例库。
 - **门禁用开发集，不用评测集**：评测集每用一次就被"看过"一次，只用于配置冻结后的定期报告。
@@ -337,6 +415,17 @@ flowchart TB
 | 干预实验 `evaluation/intervention.py` | 每次只补一类 Gold 提示，看能不能修好，用来区分"缺信息"还是"模型能力不够"；结果只作上界，不作为系统能力 |
 | 诊断准确率 `evaluation/diagnosis_eval.py` | 诊断结果对照标注器标签：规则诊断宽松准确率 76.5%，LLM 诊断 0/19 |
 
+**主要函数的功能**
+
+| 函数 | 位置 | 功能 |
+|---|---|---|
+| `run_arm` | `evaluation/loop_run.py` | 逐题运行 Loop：只把题面交给 Loop，Loop 返回后再用 Gold 判分，写逐题记录 |
+| `summarize` | `evaluation/loop_run.py` | 把逐题记录汇总成指标：首次 / 最终答对数、恢复率、误伤率、净收益、自检混淆矩阵、单技能统计、成本 |
+| `build_devset` / `dev_judges` | `evaluation/devset.py` | 按固定种子抽开发集题目，在 MySQL 上算出 Gold 结果；为每道题生成判定函数 |
+| `label_failure` | `benchmark/beaver/subtasks.py` | 把生成 SQL 和 Gold SQL 解析成语法树逐项比较，给错题标出主因和多标签 |
+| `run_intervention` | `evaluation/intervention.py` | 每次只给生成器补一类 Gold 提示重新生成，看哪类信息能修好这道题 |
+| `score` | `evaluation/diagnosis_eval.py` | 把诊断结果和标注器标签对比，计算严格 / 宽松准确率 |
+
 **设计要点**：
 - Oracle Verifier 泄露 1 bit Gold（"这题错了"），结果一律标为"上界"；
 - 误伤率专门衡量"把对的改错"，这是自我修正系统最容易忽略的风险。
@@ -353,6 +442,16 @@ flowchart TB
 | 运行 Loop 页 `app/app_pages/run_loop.py` + `app/runner.py` | 网页上选题、选模型、选策略、选修复次数、选示例方式、开关使用说明；**后台线程 + 事件列表**，页面每秒刷新时间线；已完成的题汇总成表，完整过程按需查看；和命令行走同一条执行路径 |
 | 分析报告 `app/report.py` | 运行结束后由事件直接生成，**不调用 LLM**：总体结果、逐次尝试的变化、逐题结局、各环节表现、成本、自动得出的发现；附 3 张图（修复前后柱状图、逐次折线图、逐题状态格子图） |
 | 部署 `scripts/build_app_bundle.py` + `scripts/deploy_app.py` + `app.yaml` | 数据包（schema、示例、开发集、示例库、知识文件；含 BEAVER 内容，不入库，只上传到自己的工作区）；key 放进 secret scope；App 服务主体只授予项目 catalog 权限；评测集在网页上默认锁定 |
+
+**主要函数的功能**
+
+| 函数 | 位置 | 功能 |
+|---|---|---|
+| `flatten_loop_records` | `dbx/publish.py` | 把每题的每次尝试展平成一行，附上是否答对、是否最终答案 |
+| `publish_run` | `dbx/publish.py` | 发布一次运行：先删同一 run_id 的旧数据，再写 `traces`、`evaluation` 各表和 MLflow |
+| `start_run` / `_execute` | `app/runner.py` | 网页“运行 Loop”：在后台线程里组装控制器、逐题运行、推送事件，结束后生成报告并按设置发布 |
+| `build_controller` | `app/runner.py` | 按网页上的设置组装 `LoopController`，运行页和提问页共用 |
+| `build_report` | `app/report.py` | 运行结束后根据事件生成 Markdown 分析报告和 3 张图，不调用 LLM |
 
 **设计要点**：
 - **trace 是 Loop 的调试器**：每一次修复都能回答"为什么修、修了什么、修完怎样"。

@@ -137,7 +137,32 @@ evaluation/
 dbx/publish.py        flatten_loop_records(), build_rows()            trace 发布
 ```
 
+**主要函数的功能**
+
+| 函数 | 位置 | 功能 |
+|---|---|---|
+| `BM25TableRetriever.retrieve` | `agent/retriever.py` | 用 BM25 按问题文本给 97 张表打分，返回最相关的前 20 张候选表及分数 |
+| `FewShotGenerator.generate` | `agent/generator.py` | 挑选示例、补充示例和审核知识里用到的表，拼出 prompt 调用 LLM，从回复中抽取第一版 SQL |
+| `CachingChatClient.complete` | `agent/llm.py` | 所有 LLM 调用的入口：按（模型, 参数, system, prompt）指纹查缓存，未命中才真正调用，并计入调用预算 |
+| `sql_facts` / `alias_map` | `agent/sql_analysis.py` | 解析 SQL 语法树：`sql_facts` 提取用了哪些表、列、关联、运算；`alias_map` 只给出"别名 → 表名"对应关系 |
+| `join_candidates` / `connect` | `agent/join_graph.py` | 只根据 schema 推断表之间可能的关联键：`join_candidates` 列出一组表之间的候选关联，`connect` 找出一张新表接到已用表上的方式 |
+| `DatabricksSqlExecutor.execute` | `execution/databricks_sql.py` | 只读检查后在 Databricks 上执行 SQL，超过行数上限返回 `TOO_MANY_ROWS`，出错时提取错误类别 |
+| `SelfVerifier.verify` | `loop_engineer/verifier.py` | 不看 Gold，根据执行状态、SQL 结构和结果数值判断这次尝试是否可疑，返回是否通过和触发的信号 |
+| `OracleVerifier.verify` | `loop_engineer/verifier.py` | 用 Gold 判对错，只用于估算"自检完美时 Loop 能到多好"的上界 |
+| `observe` | `loop_engineer/observer.py` | 按白名单从尝试记录中取运行时可见的字段，并从报错文本解析出错误类别、找不到的列、候选列、不存在的表 |
+| `diagnose_by_rules` | `loop_engineer/diagnose.py` | 规则诊断：根据报错信号和 schema 判断失败类型并给出修复线索；判断不了返回 `None` |
+| `Diagnoser.diagnose` | `loop_engineer/diagnose.py` | 诊断入口：先走规则，规则没有结论再调用 LLM，返回 `Diagnosis` 和 LLM 用量 |
+| `Policy.route` / `Policy.skill` | `loop_engineer/policy.py` | `route` 按"失败类型 → 技能"映射表选出技能名（被禁用的退回 RepairSQL）；`skill` 按名字取出技能对象 |
+| `LoopController.run` | `loop_engineer/controller.py` | 编排单题闭环：检索 → 生成 → 循环（执行 → 自检 → 观察 → 诊断 → 路由 → 修复）→ 选出最终答案 |
+| `RepairSkill.repair` | `skills/*.py` | 每个技能修复一类失败：先做确定性修改，解决不了的部分再带定向指令调用一次 LLM，返回新 SQL 和修复过程 |
+| `fix_column_refs` | `skills/schema_search.py` | SchemaSearch 的确定性部分：把挂错别名的列改到同一作用域里唯一拥有它的表上，并撤回会让关联条件失效的改动 |
+| `llm_repair` / `observed_text` | `skills/base.py` | `llm_repair` 用统一的修复模板调用 LLM 并抽取 SQL；`observed_text` 把报错或自检发现的问题写成 prompt 中的一段 |
+| `run_arm` / `summarize` | `evaluation/loop_run.py` | `run_arm` 逐题运行 Loop，Loop 返回后再用 Gold 判分；`summarize` 汇总恢复率、误伤率、可执行数、成本等指标 |
+| `flatten_loop_records` / `build_rows` | `dbx/publish.py` | 把每题的每次尝试展平成一行，再拆成 trace 行（`traces.*`）和对错行（`evaluation.*`）写入 Delta |
+
 ### B2. Controller：闭环的核心代码
+
+**功能**：`LoopController.run` 对一道题完成"生成 → 自检 → 诊断 → 修复"的闭环：先检索候选表、生成第一版 SQL；然后每一轮执行 SQL 并自检，不通过就观察失败现象、诊断失败类型、路由到对应技能修复，得到新的 SQL 进入下一轮；自检通过或次数用完后，从所有尝试中选出最终答案，返回 `LoopResult`。`_execute` 负责执行一条 SQL，返回执行摘要和完整结果行。
 
 `loop_engineer/controller.py`（有删节，只保留主干）：
 
@@ -224,6 +249,8 @@ RepairResult Skill                  Controller（写成下一个 attempt）新 S
 
 #### ② Observation：诊断和修复唯一能看到的"现场"
 
+**功能**：`observe` 把一次尝试的记录转换成诊断可用的观察结果：只按白名单保留运行时可见的字段，再用正则从 Databricks 报错文本中解析出错误类别、找不到的列和它的别名、数据库给的候选列、不存在的表名。
+
 ```python
 OBSERVABLE_FIELDS = ("case_id", "attempt_id", "question", "retrieved_tables", "generated_sql",
                      "parse_status", "execution_status", "execution_error",
@@ -300,6 +327,8 @@ Return the corrected query as ONE read-only SQL query ...
 
 ### B4. Verifier
 
+**功能**：`SelfVerifier.verify` 在没有 Gold 的情况下判断一次尝试是否可疑：先看执行状态（没有 SQL、报错、结果过大、空结果、整列 NULL），能执行时再检查 SQL 结构和结果数值是否自相矛盾（自检 v2，详见 [LOOP_WALKTHROUGH.md](LOOP_WALKTHROUGH.md#s3-3-2) 3.3.2），返回是否通过、触发的信号以及每个问题的证据和修复提示。`OracleVerifier.verify` 直接用 Gold 判对错，只用于上界分析。下面的代码只列出基础信号。
+
 ```python
 SELF_SIGNALS = ("no_sql", "execution_error", "too_many_rows", "empty_result", "all_null_column")
 
@@ -315,6 +344,8 @@ class OracleVerifier:                     # 只用于上界分析：和 Gold 比
 ```
 
 ### B5. Diagnoser：规则优先，没有报错信号时才用 LLM
+
+**功能**：根据观察结果判断失败属于哪一类（选表、列映射、关联键、查询拆解、领域知识、执行错误），给出置信度、原因，以及交给技能的修复线索 `repair_hints`。`diagnose_by_rules` 是规则部分，判断不了返回 `None`；`Diagnoser.diagnose` 是入口，规则没有结论时才调用 LLM。
 
 ```python
 def diagnose_by_rules(obs, catalog) -> Diagnosis | None:
@@ -340,6 +371,8 @@ class Diagnoser:
 
 ### B6. Policy：失败类型到 Skill 的映射
 
+**功能**：`Policy.route` 根据诊断出的失败类型查映射表，选出负责修复的技能名；被禁用的技能退回 RepairSQL，并标明是否为临时替代。`Policy.skill` 按名字从注册表 `SKILLS` 取出技能对象，交给 Controller 调用。
+
 ```python
 TARGETED = {
     TABLE_RETRIEVAL:     "RetrieveAgain",
@@ -362,6 +395,8 @@ class Policy:
 
 ### B7. Skill：统一接口，各自负责一类修复
 
+**功能**：每个 Skill 的 `repair` 针对一类失败修复 SQL：读取诊断给的修复线索，先做不需要 LLM 的确定性工作（改正列的别名、查出要补的表和候选关联键等），解决不了的部分再用统一的修复模板、带上自己的定向指令调用一次 LLM，返回修复后的 SQL 和修复过程（`RepairResult`）。
+
 ```python
 class RepairSkill(Protocol):
     name: str
@@ -383,6 +418,8 @@ class RepairResult:
 | **RepairSQL** | `error_class` | 带上报错信息做最小修改 | "用最小改动修复报错" + Databricks 语法限制说明 | ✅ |
 
 `fix_column_refs` 的核心（`skills/schema_search.py`）：
+
+**功能**：在不调用 LLM 的情况下修正列引用：逐个作用域检查带别名的列，列不在别名对应的表里、而同一作用域只有一张表有它时，改到那张表；改完后关联条件两边变成同一张表的，撤回改动并标记"需要真正的关联键"。返回修改后的 SQL、改动列表和改不了的引用。
 
 ```python
 for scope in traverse_scope(tree):                          # 按作用域处理（CTE、子查询分开）
@@ -430,6 +467,8 @@ for cmp in tree.find_all(EQ, NEQ, GT, GTE, LT, LTE):
 | 关联键的判定规则 | 名称以 `_CODE/_KEY/_ID/_NUMBER` 结尾等 | `agent/join_graph.py` | 只从 schema 推断 |
 
 ### B9. Trace 的代码路径
+
+**功能**：`run_arm` 在 Loop 返回之后，用 Gold 判断每次尝试是否答对，和尝试记录一起写成逐题记录；`flatten_loop_records` 把每题的每次尝试展平成一行；`build_rows` 再把尝试字段写进 `traces.execution_traces`、把对错写进 `evaluation.evaluation_results`，两类数据分表存放。
 
 ```python
 # evaluation/loop_run.py：Loop 结束后，在外部判分（Loop 看不到这一步）
