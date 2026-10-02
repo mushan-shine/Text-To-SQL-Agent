@@ -97,9 +97,11 @@ def main() -> None:
     from agent.examples import build_generator_index
     from agent.knowledge import knowledge_for
     dev_ids = {str(c["id"]) for c in load_devset(Path(cfg["dev"]["path"]))["cases"]}
+    # 1. 生成器
     generator = FewShotGenerator(client, catalog, examples, index=build_generator_index(queries, eval_ids, dev_ids, fs),
                                  k=int(fs.get("dynamic_k", 4)), max_extra_tables=int(fs.get("dynamic_max_extra_tables", 6)),
                                  knowledge=knowledge_for(cfg, ROOT))
+    # 2. 循环控制器
     controller = LoopController(BM25TableRetriever(catalog), generator, dbx,
                                 Diagnoser(catalog, client), policy, RepairContext(catalog, client, examples),
                                 LoopConfig(strategy=args.strategy, max_attempts=args.max_repairs + 1,

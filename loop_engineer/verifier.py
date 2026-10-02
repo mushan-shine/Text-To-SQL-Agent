@@ -60,12 +60,18 @@ class SelfVerifier:
                                                                     for i in range(len(rows[0]))):
                 hits.append("all_null_column")
             elif rows:
+                # 前面只是做了语法检查，SQL能不能执行，但能执行可能结果不对，所以需要语义检查，检查SQL语句是否符合问题的语义
                 for f in check_all(attempt.get("question") or "", attempt.get("generated_sql") or "", rows):
+                    # TRIGGER_SIGNALS 是离线评估中误报接近 0 的 10 个检查：
+                    # 4 个结构检查：关联条件恒为真、JOIN 无条件、"每个"却没分组、四舍五入要求不符；
+                    # 6 个数值检查：统计量为负、计数不是整数、最小值大于最大值、平均值不在最小最大之间、方差与标准差不匹配、标准差超过极差。
                     if f.signal in self.signals and f.signal in TRIGGER_SIGNALS:
+                        # 计入finding
                         findings.append(f)
                         if f.signal not in hits:
                             hits.append(f.signal)
                     else:
+                        # 计入advisories，只作为提示
                         advisories.append(f)
         return VerifierDecision(not hits, self.mode, tuple(hits), tuple(findings), tuple(advisories))
 

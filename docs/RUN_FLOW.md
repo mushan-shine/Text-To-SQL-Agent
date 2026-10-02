@@ -177,9 +177,8 @@ python scripts/phase5.py runs/phase1/<run_id>                       # 每个修�
 **入口 A：命令行**
 
 ```bash
-python scripts/phase6.py --strategy targeted --verifier self --max-repairs 2 --few-shot dynamic --knowledge on
-python scripts/phase6.py --strategy generic  --verifier self          # 对照组：通用重试
-python scripts/phase6.py --strategy targeted --verifier oracle        # 上界：Oracle 自检
+python scripts/phase6.py --verifier self --max-repairs 2 --few-shot dynamic --knowledge on
+python scripts/phase6.py --verifier oracle        # 上界：Oracle 自检
 ```
 
 [scripts/phase6.py:90-111](../scripts/phase6.py) 装配生成器、控制器、自检器，然后调用 `run_arm`。
@@ -258,8 +257,8 @@ out.write_text(kb.to_json())                                          # runs/kno
 ### 阶段 8b：外循环自动迭代 + 人工审核（产品化）
 
 ```bash
-python scripts/outer_loop.py --train-n 6 --dry-run   # 试跑：不写 Delta
-python scripts/outer_loop.py --train-n 60            # 一次迭代：提案写入 experience.proposals
+python scripts/outer_loop.py --train-n 6 --val-n 0 --dry-run   # 试跑：开发集门禁，不写 Delta
+python scripts/outer_loop.py --train-n 200 --val-n 200          # 一次迭代：验证集门禁，提案写入 experience.proposals
 ```
 
 **代码**：[scripts/outer_loop.py](../scripts/outer_loop.py) `main` → [evaluation/outer_loop.py](../evaluation/outer_loop.py)
@@ -273,9 +272,14 @@ candidates = ol.mine_table_preferences(failures, kb, catalog) \
            + ol.mine_missing_tables(failures, kb) \
            + ol.mine_join_rules(failures, kb) \
            + ol.mine_verified_queries(experience.list_feedback(...), ...)  # ③ 候选（含用户反馈）
-before = ol.run_and_judge(dev, ..., generator(...))                        # ④ 开发集：当前系统
-after  = ol.run_and_judge(dev, ..., generator(..., ol.as_curated(candidates)))  #     当前 + 候选
-regression = ol.compare(before, after)            # 答对不减少、零误伤、token 增幅 ≤ 20%
+candidates, dropped = ol.resolve_conflicts(candidates)                     #     方向相反的选表偏好
+val = ol.sample_training(queries, eval | dev | 挖掘样本, val_n, val_seed)     # ④ 验证集（与挖掘样本不重叠）
+before = ol.run_and_judge(val, ..., generator(...))                        #     验证集：当前系统
+run_with = lambda extra: ol.run_and_judge(val, ..., generator(..., extra), reuse=before_by_case)
+per_item, combined = ol.gate_candidates(candidates, before, run_with)
+dev_check = ol.compare(dev_before, run(dev, 当前系统 + 建议批准的条目))        #     开发集复核
+#   每条单独回归：答对不减少、零误伤、token 增幅 ≤ 20%；prompt 没变的题复用结果（不调 LLM、不执行）
+#   单条建议批准的 ≥ 2 条时，合在一起再回归一次（知识之间可能互相影响）
 experience.save_proposals(dbx, layout, ol.proposal_rows(batch_id, candidates, regression))  # ⑤ pending
 ```
 
@@ -366,7 +370,7 @@ databricks warehouses start 0e96e1d4ab3f34b0 -p DEFAULT
 |---|---|
 | 跑单元测试 | `python -m pytest -q` |
 | 开发集生成端对比 | `python scripts/phase1.py dev --few-shot dynamic --knowledge on` |
-| 外循环一次迭代（写入待审核提案） | `python scripts/outer_loop.py --train-n 60` |
+| 外循环一次迭代（写入待审核提案） | `python scripts/outer_loop.py --train-n 200 --val-n 200` |
 | 开发集 Loop（免费模型、前 3 题试跑） | `python scripts/phase6.py --max-repairs 2 --few-shot dynamic --limit 3` |
 | 临时切换到 DeepSeek（花费几分钱到几毛钱） | 命令前加 `LLM_PROVIDER=deepseek` |
 | 分析一次运行的错因 | `python scripts/analyze_run.py <run_id>` |

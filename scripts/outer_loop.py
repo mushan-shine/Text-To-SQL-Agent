@@ -1,12 +1,14 @@
 """Outer loop, one iteration: propose improvements, gate them on the dev set, queue them for review.
 
-    python scripts/outer_loop.py                      # 40 training questions, glm-4-flash, write proposals
-    python scripts/outer_loop.py --train-n 80 --dry-run
+    python scripts/outer_loop.py --train-n 200                 # mine on 200, gate on 200 held-out, write proposals
+    python scripts/outer_loop.py --train-n 60 --val-n 0 --dry-run   # gate on the 30-question dev set, local only
 
 Steps (evaluation/outer_loop.py): sample the training split -> run the current system -> judge against gold
-and label failures -> mine candidate knowledge (+ verified queries from user feedback) -> dev-set regression
-(current vs current + candidates) -> write PENDING proposals to experience.proposals. A data engineer
-approves or rejects them on the Review page; only approved items go live. The evaluation set is never used.
+and label failures -> mine candidate knowledge (+ verified queries from user feedback; contradicting table
+preferences resolved) -> per-item regression on a held-out validation sample of the training split (disjoint
+from the mining sample), recommended items re-checked together and on the dev set -> write PENDING proposals to
+experience.proposals. A data engineer approves or rejects them on the Review page; only approved items go live.
+The evaluation set is never used.
 """
 from __future__ import annotations
 
@@ -32,7 +34,6 @@ from agent.generator import FewShotGenerator, select_few_shot  # noqa: E402
 from agent.knowledge import load_knowledge  # noqa: E402
 from agent.llm import CachingChatClient, UsageMeter, make_client  # noqa: E402
 from agent.retriever import BM25TableRetriever, SchemaCatalog  # noqa: E402
-from benchmark.beaver.dataset import BeaverCase  # noqa: E402
 from benchmark.beaver.loader import load_cases, load_from_local_json  # noqa: E402
 from dbx import experience  # noqa: E402
 from dbx.catalog import Layout  # noqa: E402
@@ -47,9 +48,15 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--train-n", type=int, default=40, help="training questions to run this iteration")
     ap.add_argument("--seed", type=int, default=20260930)
+    ap.add_argument("--val-n", type=int, default=200,
+                    help="held-out training questions for the per-item gate (0 = gate on the 30-question dev set)")
+    ap.add_argument("--val-seed", type=int, default=20261001)
     ap.add_argument("--min-support", type=int, default=2, help="failures needed before a pattern becomes a proposal")
     ap.add_argument("--model", default=None, help="default: config llm.model (glm-4-flash)")
     ap.add_argument("--workers", type=int, default=4)
+    # an iteration is much larger than one phase-1 run (config llm.max_calls / max_tokens): its own safety budget
+    ap.add_argument("--max-calls", type=int, default=1500, help="LLM call budget for the whole iteration")
+    ap.add_argument("--max-tokens", type=int, default=20_000_000, help="LLM token budget for the whole iteration")
     ap.add_argument("--dry-run", action="store_true", help="do not write proposals to Delta")
     ap.add_argument("--config", default="config/phase1.yaml")
     args = ap.parse_args()
@@ -79,7 +86,7 @@ def main() -> None:
                                 statement_timeout_s=int(d["statement_timeout_s"]))
     layout = Layout(d["catalog"])
     max_rows = int(d["max_result_rows"])
-    meter = UsageMeter(max_calls=int(lc["max_calls"]), max_tokens=int(lc["max_tokens"]))
+    meter = UsageMeter(max_calls=args.max_calls, max_tokens=args.max_tokens)
     inner = make_client(model=args.model, max_output_tokens=int(lc["max_output_tokens"]), meter=meter) if args.model \
         else make_client(lc, max_output_tokens=int(lc["max_output_tokens"]), meter=meter)
     client = CachingChatClient(inner, ROOT / lc["cache"])
@@ -95,19 +102,14 @@ def main() -> None:
         items = list(current.items) + (list(extra.items) if extra else [])
         return attach_curated(g, CuratedKnowledge(items))
 
-    # ① + ② training sample: the sampled questions must not be their own few-shot examples
+    # ① + ② mining sample: the sampled questions must not be their own few-shot examples
+    top_k = int(cfg["retrieval"]["top_k"])
     sample = ol.sample_training(queries, eval_ids | dev_ids, args.train_n, args.seed)
-    train_cases, train_judges = [], {}
-    for q in sample:
-        c = BeaverCase.from_beaver(q, b["split"])
-        j = ol.gold_judge_from_sql(dbx, q["sql"], c.db, max_rows)
-        if j:
-            train_cases.append(c)
-            train_judges[c.case_id] = j
-    log.info("training sample: %d questions (%d with runnable gold)", len(sample), len(train_cases))
-    train_gen = generator(eval_ids | dev_ids | {str(q["id"]) for q in sample})
-    train = ol.run_and_judge(train_cases, train_judges, retriever, train_gen, dbx, schema,
-                             int(cfg["retrieval"]["top_k"]), max_rows, args.workers)
+    mine_ids = {str(q["id"]) for q in sample}
+    train_cases, train_judges = ol.judged_cases(sample, dbx, b["split"], max_rows)
+    log.info("mining sample: %d questions (%d with runnable gold)", len(sample), len(train_cases))
+    train = ol.run_and_judge(train_cases, train_judges, retriever, generator(eval_ids | dev_ids | mine_ids), dbx,
+                             schema, top_k, max_rows, args.workers)
     failures = [r for r in train if not r.correct]
     log.info("training: %s", ol.failure_summary(train))
 
@@ -116,37 +118,77 @@ def main() -> None:
         ol.mine_missing_tables(failures, kb, args.min_support) + \
         ol.mine_join_rules(failures, kb, args.min_support)
     existing_q = {i["content"]["question"].lower() for i in current.queries}
-    candidates += ol.mine_verified_queries(experience.list_feedback(dbx, layout), existing_q)
+    try:
+        feedback = experience.list_feedback(dbx, layout)
+    except Exception as e:  # e.g. the table was created by the app's service principal and is not readable here
+        log.warning("user feedback not readable, verified-query mining skipped: %s", str(e).splitlines()[0][:200])
+        feedback = None
+    candidates += ol.mine_verified_queries(feedback or [], existing_q)
+    candidates, dropped = ol.resolve_conflicts(candidates)
+    for c in dropped:
+        log.info("dropped conflicting candidate: %s (support %s)", c["title"], c["evidence"].get("support"))
     log.info("candidates: %d (%s)", len(candidates), dict(ol.Counter(c["kind"] for c in candidates)))
 
-    # ④ dev-set regression gate: current vs current + all candidates of this batch
+    # ④ regression gate, per item: current vs current + this one candidate (unchanged cases reused).
+    #    Gate set = held-out training questions (disjoint from the mining sample, dev and eval), large enough
+    #    to contain questions each candidate touches; the 30-question dev set re-checks the recommended ones.
     dcases, djudges = dev_cases(devset, b["split"]), dev_judges(devset, b["split"])
-    before = ol.run_and_judge(dcases, djudges, retriever, generator(eval_ids | dev_ids), dbx, schema,
-                              int(cfg["retrieval"]["top_k"]), max_rows, args.workers)
-    if candidates:
-        after = ol.run_and_judge(dcases, djudges, retriever, generator(eval_ids | dev_ids, ol.as_curated(candidates)),
-                                 dbx, schema, int(cfg["retrieval"]["top_k"]), max_rows, args.workers)
+    if args.val_n:
+        val = ol.sample_training(queries, eval_ids | dev_ids | mine_ids, args.val_n, args.val_seed)
+        val_ids = {str(q["id"]) for q in val}
+        gcases, gjudges = ol.judged_cases(val, dbx, b["split"], max_rows)
+        gate_set = "val"
+        log.info("validation set: %d questions (%d with runnable gold)", len(val), len(gcases))
     else:
-        after = before
-    regression = {**ol.compare(before, after), "model": inner.model, "outer_loop": ol.OUTER_LOOP_VERSION,
-                  "train": ol.failure_summary(train)}
+        val_ids, gcases, gjudges, gate_set = set(), dcases, djudges, "dev"
+    exclude = eval_ids | dev_ids | mine_ids | val_ids          # no gate question is its own example
+
+    def gate_run(cases, judges, extra=None, reuse=None):
+        return ol.run_and_judge(cases, judges, retriever, generator(exclude, extra), dbx, schema,
+                                top_k, max_rows, args.workers, reuse=reuse)
+
+    before = gate_run(gcases, gjudges)
+    reuse = {r.case.case_id: r for r in before}
+    per_item, combined = ol.gate_candidates(candidates, before, lambda extra: gate_run(gcases, gjudges, extra, reuse))
+    for c, reg in zip(candidates, per_item):
+        reg["gate_set"] = gate_set
+        log.info("gate %-16s %-70s affected=%d %d->%d fixed=%s harmed=%s passed=%s", c["kind"], c["title"][:70],
+                 len(reg["affected"]), reg["correct_before"], reg["correct_after"], reg["fixed"], reg["harmed"],
+                 reg["gate_passed"])
+    good = [c for c, reg in zip(candidates, per_item) if reg["gate_passed"] and reg["fixed"]]
+    dev_check = None
+    if good and gate_set == "val":                             # the dev set re-checks what would be recommended
+        dev_before = gate_run(dcases, djudges)
+        dev_check = {**ol.compare(dev_before, gate_run(dcases, djudges, ol.as_curated(good),
+                                                       {r.case.case_id: r for r in dev_before})),
+                     "items": len(good), "gate_set": "dev"}
+        log.info("dev check of %d recommended items: %d->%d harmed=%s", len(good), dev_check["correct_before"],
+                 dev_check["correct_after"], dev_check["harmed"])
+    batch = {"model": inner.model, "outer_loop": ol.OUTER_LOOP_VERSION, "train": ol.failure_summary(train),
+             "gate_set": gate_set, "gate_correct": sum(r.correct for r in before), "gate_cases": len(before),
+             "combined": {**combined, "gate_set": gate_set} if combined else None, "dev_check": dev_check,
+             "dropped_conflicts": [c["title"] for c in dropped],
+             "feedback_rows": None if feedback is None else len(feedback)}
 
     # ⑤ queue for review
     batch_id = experience.new_id("batch")
-    rows = ol.proposal_rows(batch_id, candidates, regression)
+    rows = ol.proposal_rows(batch_id, candidates, per_item, batch)
     out = ROOT / "runs" / "outer_loop" / batch_id
     out.mkdir(parents=True, exist_ok=True)
-    (out / "proposals.json").write_text(json.dumps({"regression": regression, "candidates": candidates,
+    (out / "proposals.json").write_text(json.dumps({"batch": batch, "per_item": per_item, "candidates": candidates,
                                                     "train_failures": ol.failure_rows(failures, kb, catalog)},
                                                    indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     if not args.dry_run:
         experience.save_proposals(dbx, layout, rows)
     dbx.close()
     print(json.dumps({"batch_id": batch_id, "proposals": len(rows), "written_to_delta": not args.dry_run,
-                      "dev": {k: regression[k] for k in ("correct_before", "correct_after", "fixed", "harmed",
-                                                         "token_increase", "gate_passed")},
-                      "recommendation": ol.recommendation(regression), "llm_usage": meter.snapshot(),
-                      "local": str(out)}, indent=2, ensure_ascii=False))
+                      "gate": f"{gate_set} {batch['gate_correct']}/{batch['gate_cases']}",
+                      "dropped_conflicts": batch["dropped_conflicts"],
+                      "items": [{"title": r["title"], "recommendation": r["recommendation"]} for r in rows],
+                      **{name: {k: chk[k] for k in ("correct_before", "correct_after", "fixed", "harmed",
+                                                    "gate_passed")} if chk else None
+                         for name, chk in (("combined", combined), ("dev_check", dev_check))},
+                      "llm_usage": meter.snapshot(), "local": str(out)}, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

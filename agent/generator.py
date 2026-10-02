@@ -98,7 +98,7 @@ def render_schema(catalog: SchemaCatalog, tables: tuple[str, ...]) -> str:
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
-
+# 创建prompt=规则+需要用到的表的说明+示例+总结的知识
 def build_prompt(task: AgentTask, schema_text: str, examples: list[FewShotExample],
                  oracle_hints: list[str] | None = None, notes: str = "") -> str:
     parts = [RULES, "", "Schema:", schema_text, ""]
@@ -154,18 +154,29 @@ class FewShotGenerator:
         """``oracle_hints`` carry GOLD annotations (BEAVER setting=1/2). Offline diagnostic analysis
         only (evaluation/intervention.py) — the agent, loop and experiments never pass them."""
         examples = self.examples
+        # 只有 dynamic 模式才有示例库；static 模式 index 为 None，整段跳过。主要作用是看相似题怎么做的
         if self.index is not None:
-            hits = self.index.top(task.question, self.k)
-            examples = [h.example for h in hits]
-            extra = [t for h in hits for t in h.tables if t in self.catalog.tables and t not in tables]
+            # 从总的5508道已解题里，按问题文本 BM25 找最相似的 k=4 道
+            # hits 里每一项是 PoolEntry，有两个字段：example（问题和 SQL）和 tables（这道题 SQL 里用到的表，建库时就已解析好）
+            hits = self.index.top(task.question, self.k) 
+            # 用这 4 道题（问题 + SQL）替换固定的 3 个示例
+            examples = [h.example for h in hits] 
+            # 把检索出来的4道相似题用到的表摊成一个列表，只有schema里真实存在且检索结构中还没有的表就加进来
+            extra = [t for h in hits for t in h.tables if t in self.catalog.tables and t not in tables]  
+            # 最多补6张
             tables = tuple(tables) + tuple(dict.fromkeys(extra))[: self.max_extra_tables]
+        # 有已批准的知识条目时才执行（没有则 CuratedKnowledge 为空、判断为假）
         if self.curated:  # approved table hints: tables weak models tend to leave out for such questions
+            # 按"补表提示"算出本题该补哪些表，（依据：外循环发现、人工批准的规则）
             tables = tuple(tables) + tuple(t for t in self.curated.extra_tables(task.question, tables)
                                            if t in self.catalog.tables)
+        # 根据问题检索表相关的知识，生成相关说明
         notes = self.knowledge.notes_for(task.question, tables) if self.knowledge is not None else ""
         reviewed = self.curated.notes_for(task.question, tables) if self.curated else ""
         notes = "\n\n".join(n for n in (reviewed, notes) if n)      # reviewed notes first: they outrank counts
+        # 生成提示词
         prompt = build_prompt(task, render_schema(self.catalog, tables), examples, oracle_hints, notes)
+        # 调用LLM，生成SQL
         r = self.client.complete(prompt, system=SYSTEM)
         sql, status = extract_sql(r.text)
         return Generation(sql, r.text, status, r, prompt, tuple(e.source_id for e in examples), tuple(tables), notes)

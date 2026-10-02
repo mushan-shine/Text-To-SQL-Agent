@@ -49,6 +49,7 @@ def run_arm(cases: list[BeaverCase], judges: dict[str, Callable], controller: Lo
             cb = (lambda step, payload, cid=case.case_id: on_event(cid, step, payload)) if on_event else None
             if on_event:
                 on_event(case.case_id, "start", {"index": i, "total": len(cases), "question": case.question})
+            # 运行示例
             res = controller.run(case.agent_view(), verifier_for(case.case_id), on_event=cb)
             judge = judges[case.case_id]
             correct = [judge(rows)[0] if a["execution_status"] == "SUCCESS" else False

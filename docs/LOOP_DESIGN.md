@@ -5,6 +5,8 @@
 > - B 部分：技术视角，包括代码、context 机制、Skill 协作方式和所有参数。
 > - C 部分：从错误分析、归因到 Skill 调用，每一步设计背后的数据依据。
 >
+> 模块、类关系、时序和数据流的架构图见 [LOOP_ARCHITECTURE.md](LOOP_ARCHITECTURE.md)。
+>
 > 代码以 `phase1-baseline` 分支 `9c65ac3` 为准。项目定位见 [PROJECT_POSITIONING.md](PROJECT_POSITIONING.md)，执行过程和数据来源见 [EXECUTION_LOG.md](EXECUTION_LOG.md)。
 
 ---
@@ -35,7 +37,7 @@
 ```
 
 - **预算**：最多 2 次尝试，也就是最多修复 1 次（`max_attempts = 2`）。
-- **第 1 次尝试**：所有实验组完全相同。
+- **第 1 次尝试**：贪心解码加 prompt 缓存，同一配置重跑时逐字相同，实验可复现。
 - **③ 和 ④ 每次尝试都会执行**：修复后的 SQL 同样要经过执行和验证。
 - **⑨ 选最终答案**：优先取最后一次**通过验证**的尝试；都没通过时，取最后一次**能执行**的；都不能执行时，取最后一次尝试。
 
@@ -142,7 +144,6 @@ dbx/publish.py        flatten_loop_records(), build_rows()            trace 发�
 ```python
 @dataclass
 class LoopConfig:
-    strategy: str = "targeted"      # targeted | generic（Generic Retry 对照组）
     max_attempts: int = 2           # 预算：最多几次 SQL 尝试
     top_k: int = 20                 # 检索的表数
     max_result_rows: int = 500_000  # 结果行数上限，超出记为 TOO_MANY_ROWS
@@ -168,18 +169,15 @@ def run(self, task: AgentTask, verifier) -> LoopResult:
             break
         # 产生下一次尝试
         nxt = {"case_id": ..., "attempt_id": n + 1, ...}
-        if self.cfg.strategy == "generic":
-            nxt.update(self._generic_retry(attempt, ...))       # 对照组：不诊断，直接要求改正
-        else:
-            obs = observe(attempt, task.db)                      # ⑤ 观察（白名单）
-            diag, usage = self.diagnoser.diagnose(obs)           # ⑥ 归因
-            route = self.policy.route(diag)                      # ⑦ 选技能
-            res = self.policy.skill(route.skill).repair(obs, diag, self.ctx)   # ⑧ 修复
-            attempt.update({"failure_type": diag.failure_type, "diagnosis_confidence": diag.confidence,
-                            "diagnosis_reason": diag.reason, "diagnosis_source": diag.source,
-                            "repair_hints": json.dumps(diag.repair_hints)})
-            nxt.update({"generated_sql": res.repaired_sql, "repair_skill": route.skill,
-                        "repair_action": res.repair_action, "used_llm": res.used_llm, ...})
+        obs = observe(attempt, task.db)                          # ⑤ 观察（白名单）
+        diag, usage = self.diagnoser.diagnose(obs)               # ⑥ 归因
+        route = self.policy.route(diag)                          # ⑦ 选技能
+        res = self.policy.skill(route.skill).repair(obs, diag, self.ctx)   # ⑧ 修复
+        attempt.update({"failure_type": diag.failure_type, "diagnosis_confidence": diag.confidence,
+                        "diagnosis_reason": diag.reason, "diagnosis_source": diag.source,
+                        "repair_hints": json.dumps(diag.repair_hints)})
+        nxt.update({"generated_sql": res.repaired_sql, "repair_skill": route.skill,
+                    "repair_action": res.repair_action, "used_llm": res.used_llm, ...})
         attempt["repaired_sql"] = nxt["generated_sql"]
         attempt["repair_skill"] = nxt["repair_skill"]
         attempt = nxt
@@ -193,7 +191,6 @@ def run(self, task: AgentTask, verifier) -> LoopResult:
 
 **设计要点**：
 - Controller 本身**不包含任何失败处理逻辑**，只负责编排。判断、归因、选技能、修复分别交给 Verifier、Diagnoser、Policy 和 Skill。每个组件都可以单独测试和替换，消融实验也可以直接替换组件。
-- **Targeted 和 Generic 共用同一个 `run()`**，唯一的差别是 `if self.cfg.strategy == "generic"` 这一个分支。这样对照实验才公平。
 - `verifier` 是 `run()` 的参数，不是 Controller 的成员。所以同一个 Controller 可以按题目换用不同的验证器，例如 OracleVerifier 需要每题各自的 Gold 判分函数。
 
 ### B3. Context 机制：各步骤之间传递什么
@@ -356,7 +353,6 @@ TARGETED = {
 
 @dataclass
 class Policy:
-    mode: str = "targeted"            # targeted | generic（generic = 全部走 RepairSQL，用于消融）
     disabled: set[str] = set()        # 被禁用的 Skill 会退回 RepairSQL（用于消融）
     mapping: dict = TARGETED          # 映射表本身也可以替换
     def route(self, diagnosis) -> Route(skill, fallback, reason)
@@ -408,20 +404,10 @@ for cmp in tree.find_all(EQ, NEQ, GT, GTE, LT, LTE):
 2. **确定性修复先行，LLM 接手剩余部分**：SchemaSearch 把能确定的部分先修好，再把修好一部分的 SQL 交给 LLM，LLM 在更好的起点上继续修复。
 3. **由 Policy 统一分派，接口一致**：Controller 不需要知道具体是哪个 Skill，替换或禁用某个 Skill 不会影响其他部分。
 
-### B8. Generic Retry（对照组）
-
-```python
-GENERIC_INSTRUCTION = "The query above is wrong. Write a corrected query."
-# 同一个 REPAIR_TEMPLATE，Diagnosis 一栏填 "(not diagnosed)"，schema 只包含检索到的表
-```
-
-与 Targeted Loop 相比，Generic Retry **只少了三样东西**：诊断、Skill 专属的修复指令、补充的表和关联键。验证器、尝试次数、第 1 次尝试都完全相同。
-
-### B9. 参数一览
+### B8. 参数一览
 
 | 参数 | 默认值 | 位置 | 作用 |
 |---|---|---|---|
-| `strategy` | `targeted` | `LoopConfig` / `--strategy` | targeted 或 generic |
 | `max_attempts` | 2 | `LoopConfig` | 尝试预算 |
 | `top_k` | 20 | `config/phase1.yaml` retrieval | 检索的表数（在 300 道非评测题上调出） |
 | `max_result_rows` | 500,000 | `config/phase1.yaml` databricks | 结果行数上限 |
@@ -443,7 +429,7 @@ GENERIC_INSTRUCTION = "The query above is wrong. Write a corrected query."
 | 候选关联键 | 10 个（SchemaSearch）/ 12 个（FindJoinPath） | 各 Skill | 控制 prompt 长度 |
 | 关联键的判定规则 | 名称以 `_CODE/_KEY/_ID/_NUMBER` 结尾等 | `agent/join_graph.py` | 只从 schema 推断 |
 
-### B10. Trace 的代码路径
+### B9. Trace 的代码路径
 
 ```python
 # evaluation/loop_run.py：Loop 结束后，在外部判分（Loop 看不到这一步）
@@ -520,7 +506,7 @@ Loop 修改的只是**这一题的 SQL**，而且有多层保护：
 
 | 局限 | 影响 | 可以改进的方向 |
 |---|---|---|
-| 只修复 1 次，第 2 次失败后不再诊断 | dw_4188 这类"修复后出现新问题"的情况没有机会再修 | 预算放宽到 3 次，并让第 2 次失败重新诊断（Generic Retry 同步放宽） |
+| 只修复 1 次，第 2 次失败后不再诊断 | dw_4188 这类"修复后出现新问题"的情况没有机会再修 | 预算放宽到 3 次，并让第 2 次失败重新诊断 |
 | 诊断只看到第一个报错 | 诊断出的往往是直接原因，而不是根因 | 同时记录"根因"和"直接原因"两种标签 |
 | 诊断置信度未校准 | 不能用置信度来决定是否修复 | 用开发集上每条规则的实际准确率替代手工设定的值 |
 | 确定性修复只用在 SchemaSearch | 其他 Skill 的 LLM 修复仍从有多处错误的 SQL 开始 | 把 `fix_column_refs` 作为所有 Skill 的前置步骤 |

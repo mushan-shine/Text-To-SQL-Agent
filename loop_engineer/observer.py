@@ -21,7 +21,15 @@ OBSERVABLE_FIELDS = ("case_id", "attempt_id", "question", "retrieved_tables", "g
 _ERROR_CLASS = re.compile(r"\[([A-Z][A-Z0-9_]+)(?:\.[A-Z0-9_]+)?\]")
 _UNRESOLVED = re.compile(r"name `([^`]+)`(?:\.`([^`]+)`)? cannot be resolved")
 _SUGGEST = re.compile(r"Did you mean one of the following\? \[([^\]]*)\]")
-_TABLE_NOT_FOUND = re.compile(r"The table or view `?([^`\s]+)`? cannot be found|TABLE_OR_VIEW_NOT_FOUND\][^`]*`([^`]+)`")
+# The whole (possibly qualified) reference: `fac_building`, `dw`.`school`, dw.school, `cat`.`dw`.`school`
+_TABLE_NOT_FOUND = re.compile(r"The table or view (\S+) cannot be found|TABLE_OR_VIEW_NOT_FOUND\][^`]*((?:`[^`]+`\.?)+)")
+_NAME_PART = re.compile(r"`([^`]+)`|([^.`]+)")
+
+
+def table_name(ref: str | None) -> str | None:
+    """Last part of a table reference, without backticks: `dw`.`school` -> school (the table, not the schema)."""
+    parts = [a or b for a, b in _NAME_PART.findall(ref or "") if (a or b).strip()]
+    return parts[-1].strip() if parts else None
 
 
 @dataclass(frozen=True)
@@ -67,7 +75,7 @@ def observe(record: dict[str, Any], db: str) -> Observation:
         execution_error=r["execution_error"], result_row_count=r["result_row_count"], result_preview=preview,
         error_class=m_cls.group(1) if m_cls else ("NO_SQL" if r["parse_status"] in ("NO_SQL", "EMPTY_RESPONSE") else None),
         unresolved_qualifier=qualifier, unresolved_column=column, suggestions=suggestions,
-        missing_table=(m_tab.group(1) or m_tab.group(2)) if m_tab else None,
+        missing_table=table_name(m_tab.group(1) or m_tab.group(2)) if m_tab else None,
         verifier_signals=tuple(r["verifier_signals"] or ()),
         verifier_findings=tuple(json.loads(r["verifier_findings"]) if isinstance(r["verifier_findings"], str)
                                 else (r["verifier_findings"] or ())),

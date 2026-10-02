@@ -377,5 +377,6 @@ def check_numeric(sql: str, rows: list[tuple] | None) -> list[Finding]:
             for sig, ex in bad.items()]
 
 
+# 校验问题与sql之间的语义是否一致，问题与结果要求是否一致，数据一致性是否满足
 def check_all(question: str, sql: str, rows: list[tuple] | None) -> list[Finding]:
     return check_static(question, sql) + check_result(question, sql, rows) + check_numeric(sql, rows)

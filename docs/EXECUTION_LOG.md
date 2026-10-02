@@ -194,6 +194,7 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 | D4 | 2026-09-25 | **维持 D3**：干预实验证明 glm-4-flash 在 5 类 Gold 提示全部给出时也修不好（0/30），但仍继续用它搭完 Phase 4–6，最后再换模型。Phase 3 标签：以确定性标注器（第一轮抽检一致率严格 75% / 宽松 90%）作为 Diagnosis Accuracy 的参照，因为干预实验在这个模型上给不出结论；换模型后重跑干预实验来校准 | 优先把 Loop 的工程结构和评测体系跑通。**已知后果**：这一轮 Loop 的恢复率可预判接近 0，实验数据只用来验证流程，不作为结论；换模型后用同一套流程重跑 |
 | D5 | 2026-09-25 | **不做 Phase 7（评测集对照实验）和 Phase 8（消融实验）**，当前重点改为优化现有代码 | 经与其他人讨论后决定。Loop 的工程结构已经跑通；Console 里 Phase 7 / 8 的预留区保留（代码已支持，以后需要时直接运行即可） |
 | D6 | 2026-09-28 | **默认模型保持 glm-4-flash**；DeepSeek 接入代码保留，`deepseek-flash`（关闭思考）作为备用，用户通知后再切换 | 探测显示 deepseek-flash 给全部 Gold 提示能修好 7/27（glm 0/30），适合展示 Loop 效果；但当前阶段重点是用免费模型修复代码、梳理流程，暂不产生费用。探测数据见本文件“换模型探测 · DeepSeek”一节 |
+| D7 | 2026-10-02 | **知识资产暂时继续用文件存储**：数仓使用说明（`kb.json`）、相似题示例库（`examples_pool`）、Agent 表结构（`schema_dw.json`）保持 JSON 文件；只有审核知识在 Delta（`experience.knowledge_items`）。迁移到 Delta 表记为**待优化点**（见 [CONTEXT_DESIGN.md](CONTEXT_DESIGN.md) G9 / F6、疑问与价值·疑问 23） | 当前重点是 Loop 与外循环本身；文件快照便于在开发集 / 验证集上做可复现的对照实验。已知代价：更新 `kb.json` 或示例库要重新打包部署 App；网页和命令行各有副本；运行元数据没有记录知识版本；`dw` 表结构变化不会被自动感知 |
 
 ## 问题记录
 
@@ -209,7 +210,8 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 | 6 | 2026-09-25 | 5.4 | 按方案 B 重跑时停在 88/100，日志约 20 分钟没有更新；MySQL 和 Databricks 上都没有正在执行的查询 | 第 89 个 case（dw_4004）返回 15,881 行，结果不一致时比较代码逐行两两比较（O(n²)，约 2.5 亿次），CPU 一直在算 | 大分组改成先排序、再逐行对齐（O(n log n)），16k 行约 0.5–1.5 秒；停掉原进程后从头重跑 |
 | 7 | 2026-09-25 | 5.4 | `03_compatibility.json` 里的 `adaptations` 变成了改写明细列表，汇总统计丢失 | 保存本地文件时，明细和汇总用了同一个键名，明细覆盖了汇总（Delta 表不受影响） | 明细改存为 `adaptation_records`；已按原数据修复本次运行的 JSON 文件 |
 | 8 | 2026-09-25 | 5.6b / 6 | dw_4188：SchemaSearch v2 确定性修复后 SQL 能执行，但返回 0 行；修复后的关联条件变成了 `sd.DEPARTMENT_CODE = sd.DEPARTMENT_CODE`、`ata.ACADEMIC_YEAR = ata.ACADEMIC_YEAR` | 错误的列引用正好在 JOIN ON 条件里，按"改到同一作用域里唯一拥有该列的表"修改后，它和等号另一侧变成了同一张表，关联条件恒为真，表之间失去关联（学期表和院系表本来就没有直接的关联键）。Phase 5 评测把它算成"报错 → 可执行"，统计虚高 | `fix_column_refs` 改完后检查所有"列 比较 列"的条件，改完后两边是同一个别名的就撤销，标记为"需要真正的关联键"，连同 schema 推断的候选关联键一起交给 LLM。补了 2 个回归测试。v2 结果归档为 `runs/phase5/repair-targeted-v2-tautology-bug.json`，Phase 6 的旧运行移到 `runs/phase6/_superseded/`，全部重跑 |
-| 9 | | | | | |
+| 9 | 2026-10-01 | 内循环 · 观察 | 表不存在的报错 `` The table or view `dw`.`school` cannot be found `` 被解析成 `missing_table = dw` | 模型照着 prompt 里 `TABLE dw.xxx` 的写法在表名前加了库名；Observer 的正则遇到第一个反引号就停止，只取到库名。诊断仍判为选表错误，但 RetrieveAgain 拿 `dw` 去找“名字相近的真实表”，给模型的候选表是错的。开发集真实运行中出现过 `` `dw`.`school` ``、`` `dw`.`sis_course_catalog` `` | 正则改为捕获完整的表引用，`table_name()` 取最后一段（去掉库名 / catalog 前缀和反引号）；新增 4 种写法的测试（无前缀、`` `dw`.`x` ``、`dw.x`、三段式）。测试 184 个通过 |
+| 10 | | | | | |
 
 ---
 
@@ -418,3 +420,17 @@ dw, information_schema, itstack, mysql, performance_schema, qgydb, sys, wechat
 | P.7 | 审核页 `app/app_pages/review.py`；导航改为 提问 / 审核 / Console / 运行 Loop；运行页加“已审核知识”开关 | ✅ | 审核页按批次显示提案、证据、开发集回归和建议，可批准 / 驳回（`SHT_REVIEWERS` 可限定审核人），已生效知识可停用，另有用户反馈和审核记录。headless（AppTest）读 Delta 验证通过。测试 174 个通过；已重新部署 Databricks App |
 
 下一步：关键词只保留在支持题中多次出现、且指向该表比例高的内容词（去掉数字和泛词）；门禁改为逐条（或小组）回归，只把通过的条目推荐批准；邮件通知待提供 SMTP 后再加。
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| P.8 | 关键词筛选 + 逐条门禁（outer-v1 改进） | ✅ | 关键词只保留：在 ≥ 2 道支持题中出现、不含数字、P(表 \| 词) ≥ 0.5 且 ≥ 2 倍于该表基础使用率。用上一批 9 条补表提示离线复查：8 条的关键词不达标被剔除（原关键词 five、12、2021fa、least 等），只剩 academic_terms（关键词 academic / regular / iap）。门禁改为逐条回归：prompt 未变的开发集题直接复用结果（按 prompt 哈希），不调 LLM、不执行 SQL；单条建议批准的 ≥ 2 条时再合用复核。审核页每条显示自己的回归结果。测试 177 个通过 |
+| P.9 | 第 3 次迭代（glm-4-flash，训练 200 题，193 题 Gold 可执行） | ✅ | batch `batch-20260930T080256-a12101`，13 条提案写入 `experience.proposals`。训练集答对 44/193、能执行 108；错因：选表 71、列映射 36、未知 22。候选：选表偏好 2、补表提示 7、关联规则 4。**逐条门禁（开发集当前 5/30）**：10 条通过但都没有新答对（其中 2 条在开发集里没有会触发的题），**3 条误伤被拦下**（tip_subject_offered 补表提示、sis_department–subject_offered_summary 关联规则：答对 5 → 3，误伤 dw_4867、dw_977；sis_course_description–sis_department 关联规则：5 → 4）。没有“建议批准”的条目。另外：两条选表偏好方向相反（academic_terms 与 academic_terms_all 互相“优先”），挖掘需要处理冲突；本次运行读 `experience.feedback` 无权限（该表由 App 服务主体创建），已跳过反馈挖掘，之后已把表的所有权转给本机账号 |
+
+**结论**：挖掘和门禁的机制已按预期工作：关键词不再混入数字和泛词，误伤条目被逐条拦下，好坏不再互相连累。但在 glm-4-flash 上，单条知识无法在 30 题开发集上证明有提升：受影响的题中，原本答错的没有被修好，而 dw_4867、dw_977 这类题对 prompt 的微小变化很敏感，几次迭代里反复被误伤。下一步：① 从训练集另留一份（如 200 题）不参与挖掘的验证集做门禁，样本更大、覆盖更多会触发知识的题；② 相反方向的选表偏好按支持度只保留一条或都丢弃；③ 在 deepseek-flash 上复核。
+
+| 步骤 | 内容 | 状态 | 结果摘要 |
+|---|---|---|---|
+| P.10 | 验证集门禁 + 冲突处理 + 迭代预算 | ✅ | 门禁题改为从训练集另抽的验证集（默认 200 题，与挖掘样本、开发集、评测集不重叠；示例库同时排除挖掘样本和验证集），建议批准的条目合用复核并在开发集上复核（`dev_check`）。方向相反的选表偏好：支持度相差 2 倍以上保留多的一方，否则都丢弃。外循环使用自己的 LLM 预算（`--max-calls` 1,500、`--max-tokens` 2,000 万）：第一次运行沿用 phase1 的 300 万 token 上限，在验证集基准轮触线中断。测试 180 个通过 |
+| P.11 | 第 4 次迭代（glm-4-flash，挖掘 200 题 + 验证 200 题） | ✅ | batch `batch-20260930T101712-30c10c`，12 条提案写入 Delta。academic_terms 与 academic_terms_all 两条相反的选表偏好（支持度都是 3）被丢弃；首次读到用户反馈（1 条），产生 1 条已验证查询候选。**验证集当前 41/194**。逐条结果：**academic_terms 补表提示 41 → 42、零误伤 → 建议批准**，开发集复核 5 → 5 无误伤；2 条中性（验证集里没有会触发的题：已验证查询、subject_offered_summary 补表提示），1 条中性（master_dept_hierarchy，影响 9 题无变化）；8 条因误伤被驳回，其中 **tip_subject_offered 补表提示 41 → 45（新答对 6、误伤 2）**、**sis_course_description–sis_department 关联规则 41 → 43（新答对 5、误伤 3）** 净收益为正。dw_4046 在 6 条候选下都被误伤，是对 prompt 变化敏感的题 |
+
+**结论**：验证集（194 题）比开发集（30 题）更有区分度：第一次出现了有净提升的条目和明确建议批准的条目。但"零误伤"对 glm 太严格：贪心解码下，prompt 的任何变化都会让少数题的答案翻转（如 dw_4046），与知识本身是否正确无关。下一步：先测量"无关改动"造成的翻转率（噪声基线），再把门禁从"零误伤"改为"净收益为正且误伤不超过噪声水平"。

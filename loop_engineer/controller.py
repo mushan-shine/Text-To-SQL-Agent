@@ -137,7 +137,7 @@ class LoopController:
         attempts, all_rows = [], []
         # 开始尝试运行SQL
         for n in range(1, self.cfg.max_attempts + 1):
-            # 执行SQL语句
+            # 执行SQL语句，exe返回的是摘要，rows返回的是原始全文
             exe, rows = self._execute(attempt["generated_sql"], task.db, attempt["parse_status"])
             attempt.update(exe)
             emit("execute", attempt_id=n, sql=attempt["generated_sql"], **exe)
@@ -152,6 +152,7 @@ class LoopController:
                  findings=findings, advisories=advisories, last=n == self.cfg.max_attempts)
             attempts.append(attempt)
             all_rows.append(rows)
+            # 验证pass或者优化次数已经达到上限，就跳出循环
             if decision.passed or n == self.cfg.max_attempts:
                 break
             # ---- produce the next attempt
@@ -163,6 +164,7 @@ class LoopController:
                 nxt.update(self._generic_retry(attempt, tuple(attempt["retrieved_tables"])))
                 details = self._last_details
             else:
+                # 验证不通过的情况，对失败情况进行观察、诊断、修复
                 # 1. 观察
                 obs = observe(attempt, task.db)   # whitelist: nothing gold-derived reaches diagnosis / repair
                 emit("observe", attempt_id=n, fields=list(OBSERVABLE_FIELDS), execution_status=obs.execution_status,

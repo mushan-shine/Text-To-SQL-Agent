@@ -5,11 +5,12 @@ from agent.curated import CuratedKnowledge, attach_curated
 from agent.examples import ExampleIndex, PoolEntry
 from agent.generator import FewShotExample, FewShotGenerator
 from agent.llm import LlmResponse
-from agent.retriever import SchemaCatalog
+from agent.retriever import Retrieval, SchemaCatalog
 from benchmark.beaver.dataset import AgentTask, BeaverCase
 from benchmark.beaver.subtasks import FailureLabel
 from dbx.experience import sql_str
 from evaluation import outer_loop as ol
+from execution.base import ExecutionResult
 
 CAT = SchemaCatalog.build("dw", [
     ("dept", "CODE", "STRING"), ("dept", "NAME", "STRING"),
@@ -85,8 +86,10 @@ def test_table_preferences_need_support_and_look_alike_tables():
 
 class KB:  # the parts of WarehouseKnowledge the miners read
     n_queries = 100
-    word_df = {"graduate": 10, "level": 40}
-    word_tables = {"graduate": {"course_desc": 9}, "level": {"course_desc": 5, "dept": 30}}
+    table_freq = {"course_desc": 20, "dept": 50}
+    word_df = {"graduate": 10, "level": 40, "five": 8, "g2021": 3}
+    word_tables = {"graduate": {"course_desc": 9}, "level": {"course_desc": 5, "dept": 30},
+                   "five": {"course_desc": 8}, "g2021": {"course_desc": 3}}
     groups: list = []
     joins = {"course_desc|dept": {"keys": {"course_desc.DEPT = dept.CODE": 7}, "kinds": {"LEFT": 7}}}
 
@@ -133,9 +136,73 @@ def test_verified_queries_from_feedback():
 
 # ---------------------------------------------------------------- regression gate + proposals
 
-def runs(correct, tokens=10):
-    return [ol.CaseResult(BeaverCase(f"dw:{i}", "dw", "q", "dw", ""), "S", "SUCCESS", ok, [], tokens)
+def runs(correct, tokens=10, prompts=None):
+    return [ol.CaseResult(BeaverCase(f"dw:{i}", "dw", "q", "dw", ""), "S", "SUCCESS", ok, [], tokens,
+                          prompt_hash=(prompts or {}).get(i, "p"))
             for i, ok in enumerate(correct)]
+
+
+def test_keywords_need_shared_content_words_that_point_at_the_table():
+    qs = ["graduate level courses with five units in g2021", "graduate level courses with five sections g2021"]
+    # "five" (number word), "g2021" (digits) and "level" (points at dept, not course_desc) are dropped;
+    # a word from only one supporting question would be dropped too
+    assert ol._keywords(qs, "course_desc", KB) == ["graduate"]
+    assert ol._keywords(["graduate courses"], "course_desc", KB) == ["graduate"]     # single question: n >= 1
+    assert ol._keywords(qs, "dept", KB) == []                                        # nothing points at dept
+    assert ol._keywords(qs, "course_desc", None) == []
+
+
+def test_per_item_gate_isolates_a_harmful_item_and_checks_the_good_ones_together():
+    before = runs([False, True, False])
+    good1, good2, bad, idle = ({"kind": "join_rule", "title": t, "content": {"tables": [t], "text": t},
+                                "evidence": {}} for t in ("g1", "g2", "bad", "idle"))
+    outcome = {"g1": ([True, True, False], {0: "x"}), "g2": ([False, True, True], {2: "y"}),
+               "bad": ([True, False, False], {0: "x", 1: "z"}), "idle": ([False, True, False], {})}
+    calls = []
+
+    def run(cur):
+        titles = [i["content"]["text"] for i in cur.items]
+        calls.append(titles)
+        if len(titles) > 1:
+            return runs([True, True, True], prompts={0: "x", 2: "y"})
+        correct, prompts = outcome[titles[0]]
+        return runs(correct, prompts=prompts)
+
+    per_item, combined = ol.gate_candidates([good1, bad, good2, idle], before, run)
+    assert [r["gate_passed"] for r in per_item] == [True, False, True, True]
+    assert per_item[1]["harmed"] == ["dw:1"] and per_item[3]["affected"] == []
+    assert calls[-1] == ["g1", "g2"] and combined["correct_after"] == 3 and combined["items"] == 2
+    recs = [ol.recommendation(r) for r in per_item]
+    assert recs[0].startswith("建议批准") and recs[1].startswith("建议驳回") and "无法验证" in recs[3]
+    rows = ol.proposal_rows("b", [good1, bad, good2, idle], per_item, {"combined": {**combined, "gate_passed": False}})
+    assert "合用时未通过" in rows[0]["recommendation"] and rows[1]["recommendation"].startswith("建议驳回")
+    assert json.loads(rows[0]["regression_json"])["batch"]["combined"]["items"] == 2
+
+
+def test_run_and_judge_reuses_unchanged_cases():
+    class Ret:
+        def retrieve(self, q, k):
+            return Retrieval(("dept",), (1.0,))
+
+    class Exec:
+        calls = 0
+
+        def execute(self, sql, db, max_rows=None):
+            Exec.calls += 1
+            return ExecutionResult("dbx", "SUCCESS", rows=[(1,)])
+
+    cases = [BeaverCase("dw:a", "dw", "graduate courses", "dw", ""), BeaverCase("dw:b", "dw", "dept names", "dw", "")]
+    judges = {c.case_id: (lambda rows: (True, "")) for c in cases}
+    first = ol.run_and_judge(cases, judges, Ret(), FewShotGenerator(Chat(), CAT, []), Exec(), {}, 5, 10)
+    assert Exec.calls == 2 and all(r.prompt_hash for r in first)
+    hint = {"item_id": "kn-h", "kind": "table_hint",
+            "content": {"table": "course_desc", "keywords": ["graduate"], "with": [], "text": "Use course_desc."}}
+    hinted = attach_curated(FewShotGenerator(Chat(), CAT, []), CuratedKnowledge([hint]))   # fires on "graduate" only
+    again = ol.run_and_judge(cases, judges, Ret(), hinted, Exec(), {}, 5, 10, reuse={r.case.case_id: r for r in first})
+    assert Exec.calls == 3                                  # only the case whose prompt changed is executed again
+    assert again[1] is first[1] and again[0].prompt_hash != first[0].prompt_hash
+    assert ol.compare(first, again)["affected"] == ["dw:a"]
+
 
 
 def test_gate_requires_no_harm_and_bounded_tokens():
@@ -152,7 +219,7 @@ def test_gate_requires_no_harm_and_bounded_tokens():
 def test_proposal_rows_carry_json_and_recommendation():
     reg = ol.compare(runs([False]), runs([True]))
     rows = ol.proposal_rows("batch-x", [{"kind": "join_rule", "title": "t", "content": JOIN["content"],
-                                          "evidence": {"support": 2}}], reg)
+                                          "evidence": {"support": 2}}], [reg])
     assert rows[0]["proposal_id"] == "batch-x-00" and json.loads(rows[0]["content_json"]) == JOIN["content"]
     assert json.loads(rows[0]["regression_json"])["gate_passed"] and rows[0]["recommendation"]
     assert ol.as_curated([{"kind": "join_rule", "content": JOIN["content"]}]).notes[0]["item_id"] == "cand-0"
@@ -160,3 +227,41 @@ def test_proposal_rows_carry_json_and_recommendation():
 
 def test_sql_str_escapes_quotes_and_backslashes():
     assert sql_str(None) == "NULL" and sql_str("it's") == "'it\\'s'" and sql_str("a\\b") == "'a\\\\b'"
+
+
+def pref(prefer, instead_of, support):
+    return {"kind": "table_preference", "title": f"{prefer}>{instead_of}",
+            "content": {"prefer": prefer, "instead_of": instead_of, "keywords": [], "text": ""},
+            "evidence": {"support": support}}
+
+
+def test_opposite_table_preferences_are_resolved_by_support():
+    join = {"kind": "join_rule", "title": "j", "content": {}, "evidence": {"support": 2}}
+    close = [pref("a", "b", 3), pref("b", "a", 3), join]                 # same support: nobody knows -> drop both
+    kept, dropped = ol.resolve_conflicts(close)
+    assert kept == [join] and len(dropped) == 2
+    clear = [pref("a", "b", 6), pref("b", "a", 3), pref("c", "d", 2)]    # 2x the support: keep the stronger one
+    kept, dropped = ol.resolve_conflicts(clear)
+    assert [c["title"] for c in kept] == ["a>b", "c>d"] and [c["title"] for c in dropped] == ["b>a"]
+
+
+def test_dev_check_failure_downgrades_recommended_items():
+    good = {**ol.compare(runs([False]), runs([True], prompts={0: "x"})), "gate_set": "val"}
+    rows = ol.proposal_rows("b", [{"kind": "join_rule", "title": "t", "content": {}, "evidence": {}}], [good],
+                            {"dev_check": {"gate_passed": False}})
+    assert "开发集复核" in rows[0]["recommendation"]
+    rows = ol.proposal_rows("b", [{"kind": "join_rule", "title": "t", "content": {}, "evidence": {}}], [good],
+                            {"dev_check": {"gate_passed": True}})
+    assert rows[0]["recommendation"].startswith("建议批准")
+
+
+def test_judged_cases_drop_questions_whose_gold_does_not_run():
+    class Exec:
+        def execute(self, sql, db, max_rows=None):
+            ok = "broken" not in sql
+            return ExecutionResult("dbx", "SUCCESS" if ok else "ERROR", rows=[(1,)] if ok else [])
+
+    qs = [{"id": 1, "question": "q1", "db": "dw", "sql": "SELECT 1"},
+          {"id": 2, "question": "q2", "db": "dw", "sql": "SELECT broken"}]
+    cases, judges = ol.judged_cases(qs, Exec(), "dw", 10)
+    assert [c.case_id for c in cases] == ["dw:1"] and judges["dw:1"]([(1,)])[0] and not judges["dw:1"]([(2,)])[0]

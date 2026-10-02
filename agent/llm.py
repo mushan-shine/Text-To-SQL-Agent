@@ -168,6 +168,7 @@ class OpenAICompatibleChatClient:
     def params(self) -> dict[str, Any]:
         return {**PROVIDERS[self.provider].greedy, "max_tokens": self.max_output_tokens}
 
+    # LLM 客户端
     def complete(self, prompt: str, system: str | None = None) -> LlmResponse:
         self.meter.check()
         messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
@@ -175,6 +176,7 @@ class OpenAICompatibleChatClient:
         for attempt in range(self.max_retries + 1):
             t0 = time.perf_counter()
             try:
+                # 向大模型发送请求
                 resp = requests.post(f"{self.base_url}/chat/completions", json=payload, timeout=self.timeout_s,
                                      headers={"Authorization": f"Bearer {self.api_key}"})
             except requests.RequestException as e:

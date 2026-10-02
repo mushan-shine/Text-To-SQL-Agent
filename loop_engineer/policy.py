@@ -24,6 +24,7 @@ from skills.schema_search import SchemaSearch
 SKILLS = {s.name: s for s in (RetrieveAgain(), SchemaSearch(), FindJoinPath(), ReplanQuery(), RepairSQL())}
 FALLBACK = "RepairSQL"
 
+# 失败类型对应的技能映射表
 TARGETED = {
     TABLE_RETRIEVAL: "RetrieveAgain",
     COLUMN_MAPPING: "SchemaSearch",
@@ -52,6 +53,7 @@ class Policy:
     def route(self, diagnosis: Diagnosis) -> Route:
         if self.mode == "generic":
             return Route(FALLBACK, False, "policy disabled: generic repair")
+        # 根据诊断到的失败类型映射到技能名称
         skill = self.mapping.get(diagnosis.failure_type, FALLBACK)
         if skill in self.disabled:
             return Route(FALLBACK, True, f"{skill} disabled (ablation)")
@@ -59,4 +61,5 @@ class Policy:
                      f"{diagnosis.failure_type} -> {skill}")
 
     def skill(self, name: str):
+        # 根据技能名称掉对应的函数
         return SKILLS[name]

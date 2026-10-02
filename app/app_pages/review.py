@@ -24,6 +24,7 @@ from dbx.catalog import Layout  # noqa: E402
 
 KIND_CN = {"table_preference": "选表偏好", "table_hint": "补表提示", "join_rule": "关联规则", "verified_query": "已验证查询"}
 LAYOUT = Layout(runner.CATALOG)
+SET_CN = {"val": "验证集", "dev": "开发集"}   # which questions a regression ran on
 
 runner.load_dotenv()
 
@@ -88,25 +89,28 @@ def content_view(kind: str, c: dict) -> None:
         st.code(c["text"], language="text", wrap_lines=True)
 
 
-def regression_view(reg: dict) -> None:
+def regression_view(reg: dict, scope: str) -> None:
+    """``scope``: what was added to the current system for this regression (one item / a batch)."""
     if not reg:
         return
+    where = SET_CN.get(reg.get("gate_set", "dev"), "开发集")
     cols = st.columns(4)
-    cols[0].metric("开发集答对", f"{reg['correct_before']} → {reg['correct_after']}", border=True,
+    cols[0].metric(f"{where}答对", f"{reg['correct_before']} → {reg['correct_after']}", border=True,
                    delta=reg["correct_after"] - reg["correct_before"])
     cols[1].metric("能执行", f"{reg['executable_before']} → {reg['executable_after']}", border=True)
     cols[2].metric("误伤（原来对、现在错）", len(reg.get("harmed") or []), border=True)
     cols[3].metric("token 变化", f"{reg['token_increase']:+.1%}", border=True)
-    st.caption(f"回归门槛：{'通过' if reg['gate_passed'] else '未通过'}（答对不减少、零误伤、token 增幅 ≤ 20%）· "
-               f"模型 {reg.get('model', '?')} · {reg.get('outer_loop', '')} · 开发集 {reg['cases']} 题。"
-               "同一批提案一起做回归，结果是整批的效果。")
+    affected = reg.get("affected")
+    st.caption(f"{scope}：回归门槛{'通过' if reg['gate_passed'] else '未通过'}（答对不减少、零误伤、token 增幅 ≤ 20%）· "
+               f"{where} {reg['cases']} 题" + (f"，其中 {len(affected)} 题的 prompt 因此改变" if affected is not None else ""))
     if reg.get("fixed") or reg.get("harmed"):
         st.caption(f"新答对：{', '.join(reg.get('fixed') or []) or '—'}；误伤：{', '.join(reg.get('harmed') or []) or '—'}")
 
 
 user = current_user()
 st.title("审核", anchor=False)
-st.caption("外层循环提出的改动不会自动上线：它们先在开发集上做回归，再由数据工程师在这里批准或驳回。"
+st.caption("外层循环提出的改动不会自动上线：它们先逐条做回归（从训练集另留、不参与挖掘的验证集），"
+           "建议批准的再在开发集上复核，最后由数据工程师在这里批准或驳回。"
            "批准后下一次提问就会使用；有问题随时在「已生效知识」里停用（回滚）。")
 if not can_review(user):
     st.info(f"当前用户 {user} 不在审核人名单（SHT_REVIEWERS）中，只能查看。", icon=":material/lock:")
@@ -134,15 +138,40 @@ with tab_p:
     for batch_id, ps in batches.items():
         ps.sort(key=lambda p: p["proposal_id"])
         with st.container(border=True):
-            st.markdown(f"**批次 `{batch_id}`** · {len(ps)} 条提案 · {ps[0]['recommendation']}")
-            regression_view(ps[0]["regression"])
-            if ps[0]["regression"].get("train"):
-                tr = ps[0]["regression"]["train"]
+            reg0 = ps[0]["regression"]
+            per_item = "batch" in reg0              # outer-v1 batches before the per-item gate: one batch regression
+            batch = reg0["batch"] if per_item else reg0
+            n_ok = sum(p["recommendation"].startswith("建议批准") for p in ps)
+            st.markdown(f"**批次 `{batch_id}`** · {len(ps)} 条提案"
+                        + (f" · {n_ok} 条建议批准" if per_item else f" · {ps[0]['recommendation']}"))
+            if "gate_correct" in batch:
+                base = f" · 当前系统{SET_CN.get(batch['gate_set'], '')}答对 {batch['gate_correct']} / {batch['gate_cases']}"
+            elif "dev_correct" in batch:
+                base = f" · 当前系统开发集答对 {batch['dev_correct']} / {batch['dev_cases']}"
+            else:
+                base = ""
+            st.caption(f"模型 {batch.get('model', '?')} · {batch.get('outer_loop', '')}{base}")
+            if not per_item:
+                regression_view(reg0, "整批一起回归")
+            else:
+                if batch.get("combined"):
+                    regression_view(batch["combined"], f"建议批准的 {batch['combined']['items']} 条合用")
+                if batch.get("dev_check"):
+                    regression_view(batch["dev_check"], f"建议批准的 {batch['dev_check']['items']} 条在开发集上复核")
+            if batch.get("dropped_conflicts"):
+                st.caption("因方向相反、支持度相近而丢弃的候选：" + "；".join(batch["dropped_conflicts"]))
+            if batch.get("train"):
+                tr = batch["train"]
                 st.caption(f"训练抽样：{tr['cases']} 题，答对 {tr['correct']}，能执行 {tr['executable']}；错误类型："
                            + ", ".join(f"{k} {v}" for k, v in tr.get("primary_labels", {}).items()))
             for p in ps:
-                with st.expander(f"{KIND_CN.get(p['kind'], p['kind'])} · {p['title']}"):
+                mark = "✅" if p["recommendation"].startswith("建议批准") else (
+                    "⛔" if p["recommendation"].startswith("建议驳回") else "➖")
+                with st.expander(f"{mark} {KIND_CN.get(p['kind'], p['kind'])} · {p['title']}"):
                     content_view(p["kind"], p["content"])
+                    if per_item:
+                        st.markdown(f"**{p['recommendation']}**")
+                        regression_view(p["regression"], "只加这一条")
                     ev = p["evidence"]
                     st.caption("证据：" + (f"{ev['support']} 道训练题出现这个错误（{', '.join(ev.get('case_ids') or [])}）"
                                           if "support" in ev else ev.get("source", "")))

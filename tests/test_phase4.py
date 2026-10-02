@@ -104,3 +104,13 @@ def test_accuracy_strict_and_lenient():
     s, rows = score(diags, labels)
     assert s["diagnosis_accuracy_strict"].startswith("1/3") and s["diagnosis_accuracy_lenient"].startswith("2/3")
     assert s["by_source"]["llm"]["n"] == 1 and len(rows) == 3
+
+
+@pytest.mark.parametrize("ref", ["`fac_building`", "`dw`.`fac_building`", "dw.fac_building",
+                                 "`self_healing_text2sql`.`dw`.`fac_building`"])
+def test_missing_table_is_the_table_not_the_schema(ref):
+    # models copy the "dw." prefix from the prompt's "TABLE dw.xxx"; the table is the last part of the reference
+    err = f"[TABLE_OR_VIEW_NOT_FOUND] The table or view {ref} cannot be found. Verify the spelling and correctness."
+    obs = observe(rec(execution_error=err), "dw")
+    assert obs.error_class == "TABLE_OR_VIEW_NOT_FOUND" and obs.missing_table == "fac_building"
+    assert D.diagnose_by_rules(obs, CAT).repair_hints["missing_table"] == "fac_building"

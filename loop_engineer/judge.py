@@ -92,6 +92,7 @@ class LlmJudge:
                                    sql=sql, rows=n_rows if n_rows is not None else len(rows or []), preview=preview,
                                    conventions=CONVENTIONS)
 
+    # 使用LLM评判 
     def judge(self, question: str, sql: str, rows: list | None, n_rows: int | None = None) -> Judgement:
         r = self.client.complete(self.prompt(question, sql, rows, n_rows), system=JUDGE_SYSTEM)
         parsed = parse_judgement(r.text)

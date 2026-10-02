@@ -186,10 +186,14 @@ class Diagnoser:
     def diagnose(self, obs: Observation) -> tuple[Diagnosis, dict[str, Any]]:
         """Returns the diagnosis and LLM usage ({} when no LLM call was made)."""
         d = diagnose_by_rules(obs, self.catalog)
+        # 如果可以通过规则诊断出对应的问题
         if d is not None:
             return d, {}
+
+        # 如果LLM客户端不存在
         if self.client is None:
             return Diagnosis(UNKNOWN, 0.0, "no explicit signal and no LLM stage", "fallback"), {}
+        # 如果规则诊断不了，LLM客户端存在，生成prompt，并调用LLM
         prompt = LLM_PROMPT.format(question=obs.question, tables=", ".join(obs.retrieved_tables),
                                    sql=obs.generated_sql, status=obs.execution_status,
                                    rows=obs.result_row_count, preview=json.dumps(obs.result_preview)[:600])
