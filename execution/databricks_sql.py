@@ -91,14 +91,24 @@ class DatabricksSqlExecutor:
             except Exception:  # statements without a result set
                 return []
 
+    def query_df(self, sql: str):
+        """Run trusted project SQL and return a pandas DataFrame (dashboards / analysis)."""
+        with self._conn.cursor() as cur:
+            cur.execute(sql)
+            return cur.fetchall_arrow().to_pandas()
+
     def use(self, catalog: str, schema: str | None = None) -> None:
         self.run(f"USE CATALOG `{catalog}`")
         if schema:
             self.run(f"USE SCHEMA `{schema}`")
         self.catalog, self._db = catalog, schema
 
-    def execute(self, sql: str, db: str) -> ExecutionResult:
-        """Run benchmark / generated SQL (read-only) against schema ``db``."""
+    def execute(self, sql: str, db: str, max_rows: int | None = None) -> ExecutionResult:
+        """Run benchmark / generated SQL (read-only) against schema ``db``.
+
+        ``max_rows`` guards against runaway results (e.g. an accidental cross join
+        in generated SQL): larger results become status ``TOO_MANY_ROWS``.
+        """
         if not is_read_only(sql, "mysql") and not is_read_only(sql, "databricks"):
             return ExecutionResult(self.engine, "REJECTED", error="not a single read-only statement")
         try:
@@ -106,8 +116,11 @@ class DatabricksSqlExecutor:
                 self.use(self.catalog, db)
             with self._conn.cursor() as cur, Timer() as t:
                 cur.execute(sql)
-                rows = [tuple(r) for r in cur.fetchall()]
+                rows = [tuple(r) for r in (cur.fetchall() if max_rows is None else cur.fetchmany(max_rows + 1))]
                 cols = [d[0] for d in cur.description] if cur.description else []
+            if max_rows is not None and len(rows) > max_rows:
+                return ExecutionResult(self.engine, "TOO_MANY_ROWS", error=f"result exceeds {max_rows} rows",
+                                       elapsed_ms=t.ms)
             return ExecutionResult(self.engine, "SUCCESS", rows, cols, elapsed_ms=t.ms)
         except Exception as e:  # connector raises ServerOperationError / DatabaseError
             msg = str(e)

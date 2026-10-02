@@ -40,7 +40,69 @@ COMPATIBILITY = pa.schema([
 
 ADAPTATIONS = pa.schema([
     ("run_id", S), ("case_id", S), ("original_gold_sql", S), ("adapted_sql", S),
-    ("adaptation_rule", S), ("semantic_validation", S), ("detail", S), ("created_at", T),
+    ("adaptation_rule", S), ("semantic_validation", S), ("detail", S),
+    ("adapted_result_hash", S),  # Databricks result hash of the adapted SQL (drift reference)
+    ("created_at", T),
+])
+
+# ---------------------------------------------------------------------------- phase 2+
+# Boundary: traces.* holds what the agent saw and did — the Observer / Diagnoser
+# read it. Anything computed from gold (correctness, table recall) lives in
+# evaluation.* so that self-verified loop components cannot see it.
+
+EXECUTION_TRACES = pa.schema([
+    ("run_id", S), ("experiment_id", S), ("case_id", S), ("split", S), ("attempt_id", I),
+    ("question", S),
+    ("retrieved_tables", S), ("retrieved_columns", S), ("retrieved_context", S),
+    ("generated_sql", S), ("parse_status", S),
+    ("execution_status", S), ("execution_error", S), ("execution_result", S),  # row count + preview
+    ("verifier_mode", S), ("verifier_decision", S), ("verifier_signals", S),
+    ("failure_type", S), ("diagnosis_confidence", pa.float64()), ("diagnosis_reason", S),
+    ("repair_skill", S), ("repair_reason", S), ("repaired_sql", S),
+    ("final_status", S),
+    ("model", S), ("prompt_version", S),
+    ("latency_ms", I), ("llm_latency_ms", I), ("exec_latency_ms", I),
+    ("input_tokens", I), ("output_tokens", I), ("total_tokens", I), ("llm_cached", B),
+    ("created_at", T),
+])
+
+EVALUATION_RESULTS = pa.schema([
+    ("run_id", S), ("experiment_id", S), ("case_id", S), ("split", S), ("attempt_id", I),
+    ("correct", B), ("eval_message", S), ("category", S),
+    ("eval_table_recall", pa.float64()), ("eval_all_gold_tables_retrieved", B),
+    ("created_at", T),
+])
+
+RUNS = pa.schema([
+    ("run_id", S), ("experiment_id", S), ("split", S), ("mode", S), ("model", S), ("prompt_version", S),
+    ("top_k", I), ("cases", I), ("correct", I), ("first_pass_accuracy", pa.float64()),
+    ("executable_rate", pa.float64()), ("tokens_total", I), ("summary_json", S), ("meta_json", S),
+    ("mlflow_run_id", S), ("created_at", T),
+])
+
+# ---- product + outer loop (schema `experience`) -------------------------------------------------
+# A user question answered by the inner loop (no gold exists for it).
+USER_QUERIES = pa.schema([
+    ("query_id", S), ("asked_by", S), ("question", S), ("model", S), ("prompt_version", S),
+    ("final_sql", S), ("execution_status", S), ("verifier_decision", S), ("result_row_count", I),
+    ("n_attempts", I), ("total_tokens", I), ("latency_ms", I), ("attempts_json", S), ("created_at", T),
+])
+# User feedback on an answer: thumbs up / down, reason, optional corrected SQL. A weak label, never gold.
+FEEDBACK = pa.schema([
+    ("feedback_id", S), ("query_id", S), ("rating", S), ("reason", S), ("corrected_sql", S),
+    ("corrected_sql_status", S), ("comment", S), ("question", S), ("final_sql", S), ("user", S),
+    ("created_at", T),
+])
+# Outer-loop proposals waiting for a data engineer's review (pending -> approved / rejected).
+PROPOSALS = pa.schema([
+    ("proposal_id", S), ("batch_id", S), ("kind", S), ("title", S), ("content_json", S), ("evidence_json", S),
+    ("regression_json", S), ("recommendation", S), ("status", S), ("reviewer", S), ("review_note", S),
+    ("created_at", T), ("reviewed_at", T),
+])
+# Approved knowledge the online system uses (active) or no longer uses (inactive = rolled back).
+KNOWLEDGE_ITEMS = pa.schema([
+    ("item_id", S), ("proposal_id", S), ("batch_id", S), ("kind", S), ("content_json", S), ("status", S),
+    ("approved_by", S), ("approved_at", T), ("deactivated_by", S), ("deactivated_at", T),
 ])
 
 GOLD_RESULTS = pa.schema([

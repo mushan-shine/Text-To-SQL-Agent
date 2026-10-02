@@ -19,13 +19,13 @@ def decide_architecture(compat: dict) -> tuple[str, str]:
     by = compat["by_status"]
     qualifiable = compat["cases"] - by.get(REFERENCE_FAILED, 0)
     ok = by.get(COMPATIBLE, 0)
-    rate = ok / qualifiable if qualifiable else 0.0
-    if rate >= 0.95:
+    usable = compat.get("usable_with_adaptations", ok)
+    if qualifiable and ok / qualifiable >= 0.95:
         return "A", f"{ok}/{qualifiable} qualifiable gold SQL reproduce the MySQL result unmodified"
-    if rate >= 0.70:
-        return "B", (f"{ok}/{qualifiable} compatible; remaining cases go through the Benchmark Adapter "
-                     "or are excluded and counted")
-    return "C", (f"only {ok}/{qualifiable} compatible — Execution Compatibility Boundary; keep BEAVER official "
+    if qualifiable and usable / qualifiable >= 0.70:
+        return "B", (f"{ok}/{qualifiable} compatible unmodified, {usable}/{qualifiable} usable with documented, "
+                     "result-validated Benchmark Adapter rules; the rest are excluded and counted")
+    return "C", (f"only {usable}/{qualifiable} usable — Execution Compatibility Boundary; keep BEAVER official "
                  "(MySQL) evaluation as reference and treat Databricks evaluation as a separate environment")
 
 
@@ -52,7 +52,13 @@ def build_report(runs_dir: str | Path = "runs/phase0") -> tuple[str, dict[str, A
 
     lines += ["## Q2 BEAVER Schema 是否能够在 Databricks 中正确还原？", ""]
     if rep:
-        answers["Q2"] = rep["tables"] > 0 and rep["tables"] == rep["tables_fidelity_ok"] and not rep["missing_dbs_in_mysql"]
+        rows_equal = rep["rows_mysql"] == rep["rows_databricks"]
+        if rep["tables"] == 0 or rep["missing_dbs_in_mysql"] or not rows_equal:
+            answers["Q2"] = "no"
+        elif rep["tables"] == rep["tables_fidelity_ok"]:
+            answers["Q2"] = "yes"
+        else:  # every row present; some column profiles differ (see list)
+            answers["Q2"] = "partial"
         lines += [f"- tables replicated: {rep['tables']}, fidelity OK: **{rep['tables_fidelity_ok']}**",
                   f"- rows MySQL / Databricks: {rep['rows_mysql']} / {rep['rows_databricks']}",
                   f"- dbs missing in MySQL: {rep['missing_dbs_in_mysql'] or 'none'}"]
@@ -73,6 +79,9 @@ def build_report(runs_dir: str | Path = "runs/phase0") -> tuple[str, dict[str, A
                   "| status | cases |", "|---|---|"]
         lines += [f"| {k} | {v} |" for k, v in compat["by_status"].items()]
         lines += ["", f"- adapter outcomes: {compat['adaptations'] or 'none attempted'}",
+                  f"- result-equivalent adaptations by rule: {compat.get('adaptations_by_rule') or 'none'}",
+                  f"- usable (compatible + result-equivalent adaptations): "
+                  f"**{compat.get('usable_with_adaptations', compat['executes_and_matches_mysql'])}/{compat['cases']}**",
                   f"- static hazards (informational): {compat['static_hazards']}", "",
                   f"**Architecture decision: case {arch}** — {why}", ""]
     else:
@@ -96,8 +105,15 @@ def build_report(runs_dir: str | Path = "runs/phase0") -> tuple[str, dict[str, A
     if gold:
         e = gold["eligibility"]
         answers["Q5"] = e.get("PRIMARY", 0) > 0
-        lines += [f"- PRIMARY (original gold SQL, result verified against MySQL): **{e.get('PRIMARY', 0)}**",
-                  f"- SECONDARY (validated adaptation, kept out of primary): {e.get('SECONDARY', 0)}",
+        src = {}
+        for r in gold.get("records", []):
+            if r["evaluation_eligibility"] == "PRIMARY":
+                k = (r["gold_source"] or "").split(":", 1)
+                key = "original gold SQL" if k[0] == "databricks_original_gold_sql" else f"adapted ({k[1] if len(k) > 1 else '?'})"
+                src[key] = src.get(key, 0) + 1
+        lines += [f"- PRIMARY (result verified against MySQL, the official engine): **{e.get('PRIMARY', 0)}**"]
+        lines += [f"  - {k}: {v}" for k, v in sorted(src.items())]
+        lines += [f"- SECONDARY (validated adaptation, kept out of primary): {e.get('SECONDARY', 0)}",
                   f"- EXCLUDED (counted, not deleted): {e.get('EXCLUDED', 0)}",
                   "- gold SQL text in benchmark.cases is the original BEAVER text; adaptations live only in "
                   "benchmark.gold_adaptations", ""]

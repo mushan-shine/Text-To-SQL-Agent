@@ -31,10 +31,10 @@
 
 | 阶段 | Phase | 在 Loop 中的角色 | 状态 |
 |---|---|---|---|
-| 一 可信基座 | 0 Benchmark Qualification | 裁判 | 🔄 代码完成，等待运行 |
+| 一 可信基座 | 0 Benchmark Qualification | 裁判 | ✅ 方案 B，89 个 PRIMARY case（2026-09-25） |
 | 二 基线与观测 | 1 Baseline · 2 Trace · 3 Failure Taxonomy | 起点、Observer 的数据、诊断的标准答案 | ⬜ |
 | 三 闭环本体 | 4 Diagnosis · 5 Repair Skills + Policy · 6 Controller + Verifier | 闭环本身 | ⬜ |
-| 四 实验证明 | 7 对照实验 · 8 消融 | 证明 | ⬜ |
+| 四 实验证明 | 7 对照实验 · 8 消融 | 证明 | ⏭ 不做（决策 D5，代码已支持） |
 | 五 展示与交付 | 9 Loop Debug Console · 作品集材料 | 展示 | ⬜ |
 | 六 外层循环 | 10 Experience Store · 11 Learning Loop · 12 Regression | 自我改进 | ⬜ 加分项 |
 
@@ -81,10 +81,10 @@
 |---|---|---|---|
 | 1.1 | **LLM 客户端**：智谱 OpenAI 兼容接口；`do_sample=False`；发请求前检查 key 里有没有控制字符；记录 token 和延迟；设置调用和 token 预算上限。可参考 `gmv-rca-agent` 的实现 | `agent/llm.py` | 同一 prompt 调用两次结果相同；超出预算会报错 |
 | 1.2 | **表检索**（setting=0）：从 `tables_meta` 里给问题挑出 top-k 张表。BEAVER 一个库有上百张表，不能全部塞进 prompt | `agent/retriever.py` | 只读 `tables_meta`，不读 Gold；k 可配置 |
-| 1.3 | **Few-shot 生成器**：prompt 模板、few-shot 示例、SQL 提取 | `agent/generator.py` | few-shot 示例**不能与评测样本重叠**（要做检查）；glm 把拒答包进代码块时能识别 |
+| 1.3 | **Few-shot 生成器**：prompt 模板、few-shot 示例、SQL 提取 | `agent/generator.py` | few-shot 示例**不能与评测样本重叠**（要做检查）；glm 把拒答包进代码块时能识别；prompt 写明目标方言是 Databricks SQL，并说明 BEAVER 中"方差/标准差"指**总体**统计量（用 `VAR_POP/STDDEV_POP`）。这是评测环境约定，不含任何 Gold 信息 |
 | 1.4 | **执行器**：只读校验，在 Databricks 上执行 | `agent/executor.py`（复用 `execution/`） | 写操作会被拒绝 |
 | 1.5 | **评测器**：与冻结的 `gold_results` 比较（官方比较规则） | `evaluation/baseline.py` | 只评 PRIMARY case |
-| 1.6 | **小样本试点**：约 20 个 case | 试点报告 | 看首次准确率和失败类型分布，决定正式样本规模；是否换模型需要单独决策 |
+| 1.6 | **小样本试点**：约 20 个 case → 已改为**开发集**（30 道非评测题，决策 D2） | 试点报告 | 看首次准确率和失败类型分布，决定正式样本规模；是否换模型需要单独决策。**prompt / 模型 / 参数只在开发集上迭代** |
 | 1.7 | **正式 Baseline**：全部 PRIMARY case，每题只生成一次，不重试 | Baseline 结果 | First-pass Accuracy 来自实际运行 |
 
 ### Phase 2 · Trace / 可观测性
